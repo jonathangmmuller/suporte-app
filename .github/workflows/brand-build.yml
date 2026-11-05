@@ -3,17 +3,17 @@ name: Brand Build
 on:
   workflow_dispatch:
     inputs:
-      brand:
-        description: "Brand to build"
-        required: true
-        default: "vancin"
-        type: choice
-        options:
-          - vancin
-          - talkincloud
       upload-tag:
         description: "Release tag name"
         required: false
+        default: "nightly"
+  workflow_call:
+    inputs:
+      upload-artifact:
+        type: boolean
+        default: true
+      upload-tag:
+        type: string
         default: "nightly"
 
 jobs:
@@ -22,6 +22,6 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ inputs.upload-tag }}
+      upload-tag: ${{ inputs.upload-tag || github.event.inputs.upload-tag || 'nightly' }}
       publish-update-metadata: false
 
