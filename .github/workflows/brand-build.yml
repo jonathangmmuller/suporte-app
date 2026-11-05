@@ -1,0 +1,27 @@
+name: Brand Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "Brand to build"
+        required: true
+        default: "vancin"
+        type: choice
+        options:
+          - vancin
+          - talkincloud
+      upload-tag:
+        description: "Release tag name"
+        required: false
+        default: "nightly"
+
+jobs:
+  run-brand-build:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ inputs.upload-tag }}
+      publish-update-metadata: false
+
