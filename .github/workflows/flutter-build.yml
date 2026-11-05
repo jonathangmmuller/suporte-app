@@ -12,6 +12,20 @@ on:
       publish-update-metadata:
         type: boolean
         default: false
+  workflow_dispatch:
+    inputs:
+      upload-artifact:
+        description: "Upload artifacts"
+        type: boolean
+        default: true
+      upload-tag:
+        description: "Release tag"
+        type: string
+        default: "nightly"
+      publish-update-metadata:
+        description: "Publish update metadata"
+        type: boolean
+        default: false
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
