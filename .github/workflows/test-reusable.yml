@@ -1,0 +1,13 @@
+name: Test Reusable
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        default: test
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "tag=${{ inputs.tag }}"
+

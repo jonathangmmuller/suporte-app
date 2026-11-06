@@ -1227,6 +1227,15 @@ pub fn get_app_name() -> String {
     hbb_common::config::APP_NAME.read().unwrap().clone()
 }
 
+/// Nome exibido nos atalhos (pode ter espaço); definido no build por SUPORTE_APP_DISPLAY.
+#[inline]
+pub fn get_app_display_name() -> String {
+    match option_env!("SUPORTE_APP_DISPLAY") {
+        Some(n) if !n.trim().is_empty() && get_app_name() == option_env!("SUPORTE_APP_NAME").unwrap_or("") => n.to_owned(),
+        _ => get_app_name(),
+    }
+}
+
 #[inline]
 pub fn is_rustdesk() -> bool {
     hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
