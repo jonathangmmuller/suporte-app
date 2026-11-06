@@ -8,6 +8,9 @@ on:
         required: false
         default: "nightly"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     uses: ./.github/workflows/flutter-build.yml
@@ -16,4 +19,3 @@ jobs:
       upload-artifact: true
       upload-tag: ${{ inputs.upload-tag }}
       publish-update-metadata: false
-
