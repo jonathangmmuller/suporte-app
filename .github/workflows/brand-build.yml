@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       upload-tag:
-        description: "Tag do release (ex: v1.0.0-vancin)"
+        description: "Tag do release (ex: v1.0.0-talkincloud)"
         required: false
         default: "nightly"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,4 +19,3 @@ jobs:
       upload-artifact: true
       upload-tag: ${{ inputs.upload-tag }}
       publish-update-metadata: false
-
