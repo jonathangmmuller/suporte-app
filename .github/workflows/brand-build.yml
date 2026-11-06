@@ -1,0 +1,19 @@
+name: Brand Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-tag:
+        description: "Tag do release (ex: v1.0.0-vancin)"
+        required: false
+        default: "nightly"
+
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ inputs.upload-tag }}
+      publish-update-metadata: false
+
