@@ -136,14 +136,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
     _autoDisconnectTimeout =
         bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-    _hideServer =
-        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
+    // Suporte Vancin/TalkInCloud: servidor fixo no app, sem tela para trocar.
+    _hideServer = true;
     _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
     _hideNetwork =
         bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) == 'Y';
-    _hideWebSocket =
-        bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y' ||
-            isWeb;
+    // Suporte Vancin/TalkInCloud: WebSocket (443) sempre ligado, sem chave para desligar.
+    _hideWebSocket = true;
     _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
     _enableTcpPunch = mainGetLocalBoolOptionSync(kOptionEnableTcpPunch);
     _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);

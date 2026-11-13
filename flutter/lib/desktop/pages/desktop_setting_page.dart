@@ -1830,12 +1830,12 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
   }
 
   Widget network(BuildContext context) {
-    final hideServer =
-        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
+    // Suporte Vancin/TalkInCloud: servidor fixo no app, sem tela para trocar.
+    const hideServer = true;
     final hideProxy =
         isWeb || bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
-    final hideWebSocket = isWeb ||
-        bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y';
+    // Suporte Vancin/TalkInCloud: WebSocket (443) sempre ligado, sem chave para desligar.
+    const hideWebSocket = true;
 
     if (hideServer && hideProxy && hideWebSocket) {
       return Offstage();
