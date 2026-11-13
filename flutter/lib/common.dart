@@ -3774,16 +3774,24 @@ Widget loadPowered(BuildContext context) {
   if (bind.mainGetBuildinOption(key: "hide-powered-by-me") == 'Y') {
     return SizedBox.shrink();
   }
+  // Crédito da marca (o aviso de licença AGPL-3.0 do RustDesk segue em Configurações > Sobre).
+  final isTalkInCloud = appName.toLowerCase().contains('talkincloud');
+  final credit = isTalkInCloud
+      ? 'Desenvolvido por TalkInCloud'
+      : 'Desenvolvido por Vancin Soluções em TI';
+  final site = isTalkInCloud
+      ? 'https://talkincloud.com.br'
+      : 'https://vancin.com.br';
   return MouseRegion(
     cursor: SystemMouseCursors.click,
     child: GestureDetector(
       onTap: () {
-        launchUrl(Uri.parse('https://rustdesk.com'));
+        launchUrl(Uri.parse(site));
       },
       child: Opacity(
           opacity: 0.5,
           child: Text(
-            translate("powered_by_me"),
+            credit,
             overflow: TextOverflow.clip,
             style: Theme.of(context)
                 .textTheme
