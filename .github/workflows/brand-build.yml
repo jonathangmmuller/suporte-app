@@ -7,6 +7,10 @@ on:
         description: "Tag do release (ex: v1.0.0-vancin)"
         required: false
         default: "nightly"
+      somente-entrada:
+        description: "Build de cliente (só recebe acesso, sem conectar em outras máquinas)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -19,3 +23,4 @@ jobs:
       upload-artifact: true
       upload-tag: ${{ inputs.upload-tag }}
       publish-update-metadata: false
+      somente-entrada: ${{ inputs.somente-entrada }}
