@@ -12,6 +12,9 @@ on:
       publish-update-metadata:
         type: boolean
         default: false
+      somente-entrada:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       upload-artifact:
@@ -24,6 +27,10 @@ on:
         default: "nightly"
       publish-update-metadata:
         description: "Publish update metadata"
+        type: boolean
+        default: false
+      somente-entrada:
+        description: "Build de cliente (só recebe acesso)"
         type: boolean
         default: false
 
@@ -39,6 +46,8 @@ env:
   SUPORTE_APP_NAME: "SuporteTalkInCloud"
   SUPORTE_APP_DISPLAY: "Suporte TalkInCloud"
   SUPORTE_FILE_PREFIX: "Suporte-TalkInCloud"
+  # Build de cliente: "1" liga o modo só entrada (hbb_common/config.rs is_incoming_only).
+  SUPORTE_SOMENTE_ENTRADA: ${{ inputs.somente-entrada && '1' || '0' }}
   SCITER_RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503, also 1.78 has ABI change which causes our sciter version not working, https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
   RUST_VERSION: "1.75" # sciter failed on m1 with 1.78 because of https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
   MAC_RUST_VERSION: "1.81" # 1.81 is requred for macos, because of https://github.com/yury/cidre requires 1.81
