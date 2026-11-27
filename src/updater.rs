@@ -1,5 +1,6 @@
 mod artifact;
 mod download;
+pub(crate) mod portal;
 
 use crate::common::do_check_software_update;
 use artifact::verified_update_artifact_from_release_page_url;
@@ -153,32 +154,34 @@ fn start_auto_update_check() -> Sender<UpdateMsg> {
 }
 
 fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
-    std::thread::sleep(INITIAL_CHECK_DELAY);
-    if let Err(e) = check_update(false) {
-        log::error!("Error checking for updates: {}", e);
-    }
-
+    // App de suporte: na abertura (30 s + até 3 min aleatórios) e depois a cada 3–5 h.
+    std::thread::sleep(portal::initial_delay());
+    let mut check_interval = match check_update(false) {
+        Ok(()) => portal::next_interval(),
+        Err(e) => {
+            log::error!("[portal-update] {}", e);
+            portal::retry_delay()
+        }
+    };
     let mut last_check_time = Instant::now();
-    let mut check_interval = DUR_ONE_DAY;
     loop {
         let recv_res = rx_msg.recv_timeout(check_interval);
         match &recv_res {
             Ok(UpdateMsg::CheckUpdate) | Err(_) => {
                 if last_check_time.elapsed() < MIN_INTERVAL {
-                    // log::debug!("Update check skipped due to minimum interval.");
                     continue;
                 }
-                // Don't check update if there are alive connections.
+                // Com sessão remota ativa não instala: tenta de novo em ~30 min.
                 if !has_no_active_conns() {
-                    check_interval = RETRY_INTERVAL;
+                    check_interval = portal::retry_delay();
                     continue;
                 }
+                last_check_time = Instant::now();
                 if let Err(e) = check_update(matches!(recv_res, Ok(UpdateMsg::CheckUpdate))) {
-                    log::error!("Error checking for updates: {}", e);
-                    check_interval = RETRY_INTERVAL;
+                    log::error!("[portal-update] {}", e);
+                    check_interval = portal::retry_delay();
                 } else {
-                    last_check_time = Instant::now();
-                    check_interval = DUR_ONE_DAY;
+                    check_interval = portal::next_interval();
                 }
             }
             Ok(UpdateMsg::Exit) => break,
@@ -186,65 +189,100 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
     }
 }
 
+/// Atualização automática (processo do serviço, Windows instalado). Fonte: só o portal da
+/// marca (ver `updater/portal.rs`); o atualizador do RustDesk não é usado.
 fn check_update(manually: bool) -> ResultType<()> {
-    // On macOS, auto-update is handled by check_update_as_root() in the service process.
-    // The shared check_update() path is only used for manual update checks from the GUI.
-    #[cfg(target_os = "macos")]
-    if !manually {
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS/Linux não instalam sozinhos: a janela do app avisa (`start_portal_notify`).
+        let _ = manually;
         return Ok(());
     }
     #[cfg(target_os = "windows")]
-    let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
-    #[cfg(not(target_os = "windows"))]
-    let update_msi = false;
-    if !(manually || config::Config::get_bool_option(keys::OPTION_ALLOW_AUTO_UPDATE)) {
-        return Ok(());
-    }
-    do_check_software_update()?;
-
-    let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();
-    if update_url.is_empty() {
-        log::debug!("No update available.");
-    } else {
-        let update_format = current_update_format(update_msi);
-        if update_format == "unknown" {
-            log::debug!("Automatic update is not supported on this platform.");
+    {
+        let Some((artifact, native_tls)) = portal::check()? else {
+            return Ok(());
+        };
+        if !manually && portal::recently_attempted(&artifact.app_version) {
+            log::warn!(
+                "[portal-update] {} já foi tentada nas últimas 24 h; aguardando",
+                artifact.app_version
+            );
             return Ok(());
         }
-        let query = crate::update_metadata::UpdateArtifactQuery {
-            platform: current_update_platform(),
-            arch: current_update_arch(),
-            format: update_format,
+        let Some(file_path) = portal_download_path(&artifact.file_name) else {
+            bail!("nome de arquivo inválido: {}", artifact.file_name);
         };
-        let artifact = verified_update_artifact_from_release_page_url(&update_url, &query)?;
-        let download_url = artifact.url.as_str();
-        #[cfg(target_os = "windows")]
-        let version = artifact.version.as_str();
-        #[cfg(target_os = "windows")]
-        log::debug!("New version available: {}", &version);
-        let Some(file_path) = get_update_download_file_from_url(download_url) else {
-            bail!("Failed to get the file path from the URL: {}", download_url);
-        };
-        ensure_verified_update_artifact(download_url, &file_path, artifact.size, &artifact.sha256)?;
-        // We have checked if the `conns` is empty before, but we need to check again.
-        // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
-        // before the download, but not empty after the download.
-        if has_no_active_conns() {
-            #[cfg(target_os = "windows")]
-            update_new_version(update_msi, version, &file_path, &artifact.sha256);
-            #[cfg(target_os = "macos")]
-            {
-                let Some(file_path) = file_path.to_str() else {
-                    bail!("Invalid UTF-8 path: {}", file_path.display());
-                };
-                crate::platform::macos::update_to_verified_dmg(
-                    file_path,
-                    &artifact.sha256,
-                    Some(artifact.size),
-                )?;
-            }
+        portal::download_verified(&artifact, native_tls, &file_path)?;
+        // O download pode levar minutos: confere de novo se ninguém conectou.
+        if !has_no_active_conns() {
+            bail!("sessão remota ativa; instalação de {} adiada", artifact.app_version);
         }
+        portal::mark_attempt(&artifact.app_version);
+        // EXE (nunca MSI): `--update` troca os binários e religa o serviço; ID, senha
+        // permanente e configuração ficam no perfil do serviço e não são tocados.
+        update_new_version(false, &artifact.app_version, &file_path, &artifact.sha256);
+        Ok(())
     }
+}
+
+#[cfg(target_os = "windows")]
+fn portal_download_path(file_name: &str) -> Option<PathBuf> {
+    if file_name.is_empty() || file_name.contains(['/', '\\', ':']) || file_name.starts_with('.') {
+        return None;
+    }
+    Some(std::env::temp_dir().join(file_name))
+}
+
+/// Aviso de versão nova na janela do app (macOS, Linux e Windows não instalado).
+/// Consulta na abertura e a cada 3–5 h; com versão nova, manda o evento
+/// `check_software_update_finish` para a interface com:
+///   - macOS: `file://` do DMG já baixado e conferido (sha256 do manifesto assinado);
+///   - Linux / Windows portátil: a URL do instalador no portal (só aviso).
+pub fn start_portal_notify() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let r = std::thread::Builder::new()
+            .name("portal-update-notify".to_owned())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                loop {
+                    let wait = match portal_notify_once() {
+                        Ok(()) => portal::next_interval(),
+                        Err(e) => {
+                            log::warn!("[portal-update] aviso: {}", e);
+                            portal::retry_delay()
+                        }
+                    };
+                    std::thread::sleep(wait);
+                }
+            });
+        if let Err(e) = r {
+            log::error!("[portal-update] thread de aviso: {}", e);
+        }
+    });
+}
+
+fn portal_notify_once() -> ResultType<()> {
+    #[cfg(target_os = "windows")]
+    if crate::platform::is_installed() {
+        // Instalado no Windows: o serviço atualiza sozinho.
+        return Ok(());
+    }
+    let Some((artifact, _native_tls)) = portal::check()? else {
+        return Ok(());
+    };
+    #[cfg(target_os = "macos")]
+    let url = {
+        let path = std::env::temp_dir().join(&artifact.file_name);
+        portal::download_verified(&artifact, _native_tls, &path)?;
+        url::Url::from_file_path(&path)
+            .map_err(|_| hbb_common::anyhow::anyhow!("caminho inválido: {}", path.display()))?
+            .to_string()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let url = artifact.url.clone();
+    crate::common::set_portal_update_url(url, &artifact.app_version);
     Ok(())
 }
 
@@ -472,6 +510,11 @@ fn wait_for_failed_update_retry() {
 /// Called from `start_os_service()` which runs as root via LaunchDaemon.
 #[cfg(target_os = "macos")]
 pub fn start_auto_update_macos() {
+    if crate::is_custom_client() {
+        // App de suporte: o macOS só baixa, confere e avisa (ver `start_portal_notify`).
+        log::info!("[root-update] custom client: silent root update disabled");
+        return;
+    }
     let spawn_result = std::thread::Builder::new()
         .name("rustdesk-auto-update".to_owned())
         .spawn(|| {

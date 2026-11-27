@@ -33,6 +33,35 @@ pub(super) fn ensure_verified_update_artifact(
         }
     }
     let client = create_http_client_with_url_strict(download_url)?;
+    download_verified_with_client(&client, download_url, file_path, expected_size, expected_sha256)
+}
+
+/// Igual a `ensure_verified_update_artifact`, com o cliente HTTP do chamador (o atualizador
+/// do portal usa um cliente só-HTTPS e sem seguir redirecionamento).
+pub(super) fn ensure_verified_update_artifact_with_client(
+    client: &reqwest::blocking::Client,
+    download_url: &str,
+    file_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> ResultType<()> {
+    if let Some(file_size) = cached_update_artifact_size(file_path)? {
+        if file_size == expected_size && verify_file_sha256(file_path, expected_sha256).is_ok() {
+            return Ok(());
+        }
+        log::warn!("Removing cached update file that does not match the signed manifest");
+        remove_cached_update_artifact(file_path)?;
+    }
+    download_verified_with_client(client, download_url, file_path, expected_size, expected_sha256)
+}
+
+fn download_verified_with_client(
+    client: &reqwest::blocking::Client,
+    download_url: &str,
+    file_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> ResultType<()> {
     let response = client.get(download_url).send()?;
     if !response.status().is_success() {
         bail!(
@@ -143,7 +172,7 @@ fn create_download_temp_file(final_path: &Path) -> ResultType<(std::fs::File, Pa
     bail!("Failed to create temporary update file");
 }
 
-fn write_verified_update_artifact<R: Read>(
+pub(super) fn write_verified_update_artifact<R: Read>(
     final_path: &Path,
     reader: &mut R,
     expected_size: u64,

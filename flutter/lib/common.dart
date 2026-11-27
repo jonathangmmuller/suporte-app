@@ -4113,12 +4113,20 @@ void earlyAssert() {
   assert('\1' == '1');
 }
 
+/// Versão nova anunciada pelo portal (app de suporte).
+String portalUpdateVersion = '';
+
 void checkUpdate() {
   if (!isWeb) {
-    if (!bind.isCustomClient()) {
+    // App de suporte (custom client): o Rust só consulta o portal da marca e só manda o
+    // evento depois de conferir o manifesto assinado.
+    {
       platformFFI.registerEventHandler(
           kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
           (Map<String, dynamic> evt) async {
+        if (evt['version'] is String) {
+          portalUpdateVersion = evt['version'];
+        }
         if (evt['url'] is String) {
           stateGlobal.updateUrl.value = evt['url'];
         }

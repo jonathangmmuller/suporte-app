@@ -1,0 +1,27 @@
+{
+ "schema": 1,
+ "brand": "vancin",
+ "variant": "cliente",
+ "host": "portal.vancin.com.br",
+ "app_version": "1.0.7",
+ "version": "1.5.1",
+ "release": "v1.0.7-vancin-cliente",
+ "files": [
+  {
+   "os": "windows",
+   "arch": "x64",
+   "file": "Suporte-Vancin-1.5.1-x86_64.exe",
+   "download_name": "Suporte Vancin 1.5.1 Windows.exe",
+   "size": 9,
+   "sha256": "33d8bf2aaf8569821daa9e6e108ea190254ca8ed2598a47d7664328cb51a1ca8"
+  },
+  {
+   "os": "macos",
+   "arch": "arm64",
+   "file": "Suporte-Vancin-1.5.1-aarch64.dmg",
+   "download_name": "Suporte Vancin 1.5.1 macOS.dmg",
+   "size": 9,
+   "sha256": "6d1675f8344ab4f028fef8558237e8c7d3d5faab4eeeaeeff51d72416b98bdaa"
+  }
+ ]
+}

@@ -428,6 +428,25 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
+    // App de suporte: aviso de versão nova vinda do portal da marca (macOS/Linux; no Windows
+    // instalado o serviço atualiza sozinho). No macOS a URL é o DMG já baixado e conferido.
+    if (bind.isCustomClient() &&
+        updateUrl.isNotEmpty &&
+        !isCardClosed &&
+        (updateUrl.startsWith('https://') || updateUrl.startsWith('file://'))) {
+      final appName = bind.mainGetAppNameSync();
+      final ver = portalUpdateVersion.isEmpty ? '' : ' ($portalUpdateVersion)';
+      final local = updateUrl.startsWith('file://');
+      return buildInstallCard(
+          "Status",
+          local
+              ? "Nova versão do $appName$ver baixada e conferida. Abra, arraste para Aplicativos e libere de novo as permissões."
+              : "Nova versão do $appName$ver disponível no portal.",
+          local ? "Abrir instalador" : "Baixar",
+          () async {
+        await launchUrl(Uri.parse(updateUrl));
+      }, closeButton: true);
+    }
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&

@@ -3608,10 +3608,23 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    let restore_service_cmd = if is_service_running {
-        format!("sc start {}", &app_name)
+    // App de suporte: a máquina não pode ficar sem serviço (inacessível) se este script for
+    // interrompido entre o `sc stop` e o `sc start`. Antes de parar, deixa um processo
+    // destacado que religa o serviço em ~90 s (se já estiver rodando, `sc start` não faz nada);
+    // depois da cópia, confere e tenta de novo.
+    let (service_guard_cmd, restore_service_cmd) = if is_service_running {
+        (
+            format!(
+                "start \"\" /min cmd /d /c \"ping -n 91 127.0.0.1 >nul & sc start {app_name} >nul\""
+            ),
+            format!(
+                "sc start {app_name}
+ping -n 6 127.0.0.1 >nul
+sc query {app_name} | find \"RUNNING\" >nul || sc start {app_name}"
+            ),
+        )
     } else {
-        "".to_owned()
+        ("".to_owned(), "".to_owned())
     };
 
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
@@ -3641,6 +3654,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
+{service_guard_cmd}
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
 {reg_cmd}

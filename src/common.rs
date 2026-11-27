@@ -1059,6 +1059,9 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 
 pub fn check_software_update() {
     if is_custom_client() {
+        // App de suporte: nunca consulta o RustDesk; só o portal da própria marca.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        crate::updater::start_portal_notify();
         return;
     }
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
@@ -1143,6 +1146,24 @@ pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<St
         bail!("Release id has invalid display version: {}", release_id);
     }
     Ok(display_version.to_owned())
+}
+
+/// Versão nova encontrada no portal (manifesto assinado já conferido): avisa a interface.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn set_portal_update_url(url: String, app_version: &str) {
+    #[cfg(feature = "flutter")]
+    {
+        let mut m = HashMap::new();
+        m.insert("name", "check_software_update_finish");
+        m.insert("url", &url);
+        m.insert("version", app_version);
+        if let Ok(data) = serde_json::to_string(&m) {
+            let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+        }
+    }
+    #[cfg(not(feature = "flutter"))]
+    let _ = app_version;
+    *SOFTWARE_UPDATE_URL.lock().unwrap() = url;
 }
 
 fn clear_software_update_url() {
