@@ -186,6 +186,9 @@ jobs:
     needs: [build-RustDeskTempTopMostWindow, generate-bridge]
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -598,6 +601,17 @@ jobs:
           timeout 120 ./rustdesk/rustdesk.exe --suporte-build-info "$R"
           python3 res/suporte_build_info.py --tag "$TAG_NAME" --relatorio "$R" \
             ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.exe ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.msi
+
+      # Procedência: o publicador só aceita arquivo com atestação deste repositório,
+      # assinada por flutter-build.yml e chamada por brand-build.yml no ref da marca.
+      - name: Atestar procedência (instaladores + build-info)
+        if: env.UPLOAD_ARTIFACT == 'true' && startsWith(env.TAG_NAME, 'v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.exe
+            ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.msi
+            ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.build-info.json
 
       - name: Upload signed Windows Flutter EXE
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
@@ -1926,6 +1940,11 @@ jobs:
 
   build-rustdesk-linux:
     needs: [generate-bridge]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
     strategy:
@@ -2230,6 +2249,14 @@ jobs:
           set -euo pipefail
           # binário do container não roda aqui: confere tag × ambiente da compilação
           python3 res/suporte_build_info.py --tag "$TAG_NAME" --sem-binario rustdesk-*.deb
+
+      - name: Atestar procedência (deb + build-info)
+        if: env.UPLOAD_ARTIFACT == 'true' && startsWith(env.TAG_NAME, 'v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            rustdesk-*.deb
+            rustdesk-*.deb.build-info.json
 
       - name: Publish debian/rpm package
         if: env.UPLOAD_ARTIFACT == 'true'

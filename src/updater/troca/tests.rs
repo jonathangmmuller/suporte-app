@@ -51,7 +51,10 @@ struct Cenario {
 impl Cenario {
     fn novo(exe_novo: &str) -> Self {
         let raiz = tmp();
-        let c = Caminhos::de(&raiz.join("Program Files").join("SuporteVancin"));
+        let c = Caminhos::de(
+            &raiz.join("Program Files").join("SuporteVancin"),
+            &raiz.join("ProgramData").join("SuporteVancin").join("atualizacao"),
+        );
         escrever(&c.atual.join(EXE), "BOM 1.0.6");
         escrever(&c.atual.join("librustdesk.dll"), "dll 1.0.6");
         escrever(&c.atual.join("custom.txt"), "config embutida");
@@ -84,15 +87,19 @@ impl Cenario {
             exe_destino: EXE,
             extras: &extras,
             remover: &["meta.toml"],
+            criar_novo: criar_pasta,
         };
         let eventos = s.eventos.clone();
+        let troca = self.c.troca.clone();
         atualizar(
             &self.c,
             &p,
             copiar,
+            &mut |_| Ok(()),
             validar,
             &mut || {
                 eventos.borrow_mut().push("guarda".to_owned());
+                fs::create_dir_all(&troca)?;
                 Ok(())
             },
             s,
@@ -118,21 +125,30 @@ impl Drop for Cenario {
 }
 
 struct Falso {
-    atual: PathBuf,
+    c: Caminhos,
     estado: Servico,
     consultas_ate_cair: Option<u32>,
+    /// Nada sobe (serviço quebrado / conta do serviço sem permissão).
+    quebrado: bool,
     /// pasta de origem → quantas vezes ainda falhar o rename
     falhas_renomear: HashMap<PathBuf, u32>,
+    /// Tarefas da recuperação registradas.
+    tarefas: bool,
+    /// Operações até a "queda de energia" (pânico); `None` = sem queda.
+    vida: Option<u32>,
     eventos: Rc<RefCell<Vec<String>>>,
 }
 
 impl Falso {
     fn novo(c: &Caminhos) -> Self {
         Self {
-            atual: c.atual.clone(),
+            c: c.clone(),
             estado: Servico::Rodando,
             consultas_ate_cair: None,
+            quebrado: false,
             falhas_renomear: HashMap::new(),
+            tarefas: true,
+            vida: None,
             eventos: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -142,10 +158,24 @@ impl Falso {
     fn eventos(&self) -> Vec<String> {
         self.eventos.borrow().clone()
     }
+    fn operacao(&mut self) {
+        if let Some(v) = self.vida.as_mut() {
+            if *v == 0 {
+                panic!("queda de energia simulada");
+            }
+            *v -= 1;
+        }
+    }
+}
+
+/// Invariante: sempre existe uma pasta instalada utilizável (com o EXE).
+fn alguma_utilizavel(c: &Caminhos) -> bool {
+    Pasta::TODAS.iter().any(|p| c.pasta(*p).join(EXE).is_file())
 }
 
 impl Sistema for Falso {
     fn servico(&mut self) -> Servico {
+        self.operacao();
         if let Some(n) = self.consultas_ate_cair.as_mut() {
             if *n == 0 {
                 self.estado = Servico::Parado;
@@ -157,14 +187,16 @@ impl Sistema for Falso {
         self.estado
     }
     fn parar_servico(&mut self) {
+        self.operacao();
         self.ev("parar");
         self.estado = Servico::Parado;
         self.consultas_ate_cair = None;
     }
     fn iniciar_servico(&mut self) {
-        let exe = ler(&self.atual.join(EXE));
+        self.operacao();
+        let exe = ler(&self.c.atual.join(EXE));
         self.ev(format!("iniciar:{exe}"));
-        if self.estado == Servico::Rodando {
+        if self.estado == Servico::Rodando || self.quebrado {
             return;
         }
         if exe.starts_with("BOM") {
@@ -175,9 +207,11 @@ impl Sistema for Falso {
         }
     }
     fn encerrar_processos(&mut self) {
+        self.operacao();
         self.ev("taskkill");
     }
     fn renomear(&mut self, de: &Path, para: &Path) -> io::Result<()> {
+        self.operacao();
         if let Some(n) = self.falhas_renomear.get_mut(de) {
             if *n > 0 {
                 *n -= 1;
@@ -185,14 +219,28 @@ impl Sistema for Falso {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "em uso"));
             }
         }
+        // como o `ren` do cmd e o `SistemaWindows`: destino existente = erro
+        if para.exists() {
+            self.ev("ren-destino-existe");
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destino existe"));
+        }
         self.ev(format!(
             "ren:{}>{}",
             de.file_name().unwrap().to_string_lossy(),
             para.file_name().unwrap().to_string_lossy()
         ));
-        fs::rename(de, para)
+        let r = fs::rename(de, para);
+        assert!(alguma_utilizavel(&self.c), "sem instalação utilizável após {de:?}->{para:?}");
+        r
     }
-    fn esperar(&mut self, _d: Duration) {}
+    fn esperar(&mut self, _d: Duration) {
+        self.operacao();
+    }
+    fn apagar_tarefas(&mut self) {
+        self.operacao();
+        self.ev("apagar-tarefas");
+        self.tarefas = false;
+    }
 }
 
 fn validar_ok(p: &Path) -> ResultType<()> {
@@ -304,11 +352,13 @@ fn falha_ao_montar_guarda_nao_para_o_servico() {
         exe_destino: EXE,
         extras: &extras,
         remover: &[],
+        criar_novo: criar_pasta,
     };
     let r = atualizar(
         &k.c,
         &p,
         &mut copiar_arquivo,
+        &mut |_| Ok(()),
         &mut validar_ok,
         &mut || bail!("schtasks indisponível"),
         &mut s,
@@ -412,6 +462,7 @@ fn recuperacao_em_cada_ponto_de_interrupcao() {
             exe_destino: EXE,
             extras: &extras,
             remover: &[],
+            criar_novo: criar_pasta,
         };
         preparar(&k.c, &p, &mut copiar_arquivo).unwrap();
         fs::create_dir_all(&k.c.troca).unwrap();
@@ -452,6 +503,7 @@ fn limpar_restos_nao_toca_a_atual() {
     for d in [&k.c.novo, &k.c.anterior, &k.c.falhou, &k.c.troca] {
         escrever(&d.join("x"), "resto");
     }
+    escrever(&k.c.concluido(), "ok");
     k.c.limpar_restos().unwrap();
     for d in [&k.c.novo, &k.c.anterior, &k.c.falhou, &k.c.troca] {
         assert!(!d.exists());
@@ -461,10 +513,454 @@ fn limpar_restos_nao_toca_a_atual() {
 
 #[test]
 fn caminhos_irmaos() {
-    let c = Caminhos::de(Path::new(r"C:\Program Files\SuporteVancin"));
+    let c = Caminhos::de(
+        Path::new(r"C:\Program Files\SuporteVancin"),
+        Path::new(r"C:\ProgramData\SuporteVancin\atualizacao"),
+    );
     assert_eq!(c.novo, PathBuf::from(r"C:\Program Files\SuporteVancin.novo"));
     assert_eq!(c.anterior, PathBuf::from(r"C:\Program Files\SuporteVancin.anterior"));
+    // a pasta dos scripts SYSTEM não fica mais ao lado da instalação (achado 1)
+    assert_eq!(c.troca, PathBuf::from(r"C:\ProgramData\SuporteVancin\atualizacao"));
     assert_eq!(c.troca.join("concluido"), c.concluido());
+}
+
+
+fn caminhos_windows() -> Caminhos {
+    Caminhos::de(
+        Path::new("C:/Program Files/SuporteVancin"),
+        Path::new("C:/ProgramData/SuporteVancin/atualizacao"),
+    )
+}
+
+// ------------------------------------------------------------------------------------
+// R3, achado 1: conferência de ACL/reparse nos pontos de execução e de troca.
+// ------------------------------------------------------------------------------------
+
+impl Cenario {
+    fn rodar_conferindo(
+        &self,
+        s: &mut Falso,
+        conferir: &mut dyn FnMut(Momento) -> ResultType<()>,
+        criar_novo: fn(&Path) -> io::Result<()>,
+        executou: &mut bool,
+    ) -> Resultado {
+        let extras: Vec<(PathBuf, String)> = vec![];
+        let p = Preparo {
+            origem: &self.origem,
+            exe_origem: "rustdesk.exe",
+            exe_destino: EXE,
+            extras: &extras,
+            remover: &[],
+            criar_novo,
+        };
+        let eventos = s.eventos.clone();
+        let troca = self.c.troca.clone();
+        atualizar(
+            &self.c,
+            &p,
+            &mut copiar_arquivo,
+            conferir,
+            &mut |e| {
+                *executou = true;
+                validar_ok(e)
+            },
+            &mut || {
+                eventos.borrow_mut().push("guarda".to_owned());
+                fs::create_dir_all(&troca)?;
+                Ok(())
+            },
+            s,
+            true,
+            &T0,
+        )
+    }
+}
+
+#[test]
+fn acl_recusada_antes_de_executar_nao_executa_nem_para() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    let mut executou = false;
+    let mut momentos = vec![];
+    let r = k.rodar_conferindo(
+        &mut s,
+        &mut |m| {
+            momentos.push(m);
+            bail!("Usuários podem gravar na pasta-mãe")
+        },
+        criar_pasta,
+        &mut executou,
+    );
+    assert!(matches!(r, Resultado::NaoTrocado(ref m) if m.contains("pasta-mãe")), "{r:?}");
+    assert_eq!(momentos, vec![Momento::AntesDeExecutar]);
+    assert!(!executou, "executou o EXE de uma pasta não protegida");
+    assert!(s.eventos().is_empty());
+    assert!(!k.c.novo.exists());
+    k.anterior_intacta_no_lugar();
+}
+
+#[test]
+fn acl_recusada_antes_de_trocar_nao_para_o_servico() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    let mut executou = false;
+    let r = k.rodar_conferindo(
+        &mut s,
+        &mut |m| match m {
+            Momento::AntesDeExecutar => Ok(()),
+            Momento::AntesDeTrocar => bail!("recuperar.bat com hash diferente"),
+        },
+        criar_pasta,
+        &mut executou,
+    );
+    assert!(matches!(r, Resultado::NaoTrocado(ref m) if m.contains("hash")), "{r:?}");
+    assert!(executou);
+    assert_eq!(s.eventos(), vec!["guarda".to_owned()], "parou o serviço");
+    assert!(!k.c.novo.exists());
+    k.anterior_intacta_no_lugar();
+}
+
+/// Alguém recria `.novo` entre a limpeza e a criação: a criação (que exige pasta nova, com a
+/// DACL protegida) falha e nada é trocado.
+#[test]
+fn novo_recriado_por_terceiro_e_recusado() {
+    fn criar_com_corrida(p: &Path) -> io::Result<()> {
+        fs::create_dir_all(p)?; // "o atacante chegou antes"
+        criar_pasta(p)
+    }
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    let mut executou = false;
+    let r = k.rodar_conferindo(&mut s, &mut |_| Ok(()), criar_com_corrida, &mut executou);
+    assert!(matches!(r, Resultado::NaoTrocado(ref m) if m.contains(".novo")), "{r:?}");
+    assert!(!executou && s.eventos().is_empty());
+    k.anterior_intacta_no_lugar();
+}
+
+#[test]
+fn recuperacao_pendente_impede_nova_atualizacao_e_limpeza() {
+    let k = Cenario::novo("BOM 1.0.7");
+    fs::rename(&k.c.atual, &k.c.anterior).unwrap(); // troca interrompida
+    escrever(&k.c.troca.join(SCRIPT_RECUPERAR), "@echo off");
+    assert!(k.c.recuperacao_pendente());
+    let e = k.c.limpar_restos().unwrap_err().to_string();
+    assert!(e.contains("pendente"), "{e}");
+    assert_eq!(ler(&k.c.anterior.join(EXE)), "BOM 1.0.6", "apagou a única cópia");
+    assert!(k.c.troca.join(SCRIPT_RECUPERAR).is_file());
+    // depois de recuperada (concluido), a limpeza volta a valer
+    let mut s = Falso::novo(&k.c);
+    assert!(recuperar(&k.c, EXE, &mut s, &T0));
+    assert!(!k.c.recuperacao_pendente());
+    k.c.limpar_restos().unwrap();
+    k.anterior_intacta_no_lugar();
+}
+
+// ------------------------------------------------------------------------------------
+// R3, achado 3: partida não confirmada = Critico.
+// ------------------------------------------------------------------------------------
+
+#[test]
+fn nada_trocado_mas_servico_nao_volta_e_critico() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    s.quebrado = true;
+    s.falhas_renomear.insert(k.c.atual.clone(), 99);
+    let r = k.rodar(&mut copiar_arquivo, &mut validar_ok, &mut s);
+    assert!(matches!(r, Resultado::Critico(ref m) if m.contains("presa") && m.contains("RUNNING")), "{r:?}");
+    assert!(!r.consistente());
+    k.anterior_intacta_no_lugar();
+}
+
+#[test]
+fn nova_nao_entra_e_servico_nao_volta_e_critico() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    s.quebrado = true;
+    s.falhas_renomear.insert(k.c.novo.clone(), 99);
+    let r = k.rodar(&mut copiar_arquivo, &mut validar_ok, &mut s);
+    assert!(matches!(r, Resultado::Critico(ref m) if m.contains("não entrou")), "{r:?}");
+    k.anterior_intacta_no_lugar();
+}
+
+/// A anterior volta, sobe e cai: R2 dizia `Revertido` (só esperava RUNNING uma vez). Agora é
+/// `Critico`, e a recuperação fica pendente (tarefas mantidas, sem `concluido`).
+#[test]
+fn revertido_com_anterior_que_sobe_e_cai_e_critico_e_fica_pendente() {
+    let k = Cenario::novo("RUIM 1.0.7");
+    escrever(&k.c.atual.join(EXE), "CAI 1.0.6");
+    let mut s = Falso::novo(&k.c);
+    let r = k.rodar(&mut copiar_arquivo, &mut validar_ok, &mut s);
+    assert!(matches!(r, Resultado::Critico(ref m) if m.contains("RUNNING")), "{r:?}");
+    assert_eq!(ler(&k.c.atual.join(EXE)), "CAI 1.0.6");
+    for _ in 0..3 {
+        // tarefa de minuto em minuto
+        let saida = executar(&programa_recuperar(), &k.c, EXE, &mut s, &T0, &mut |_, _| {});
+        assert_eq!(saida, Saida::Pendente);
+        assert!(s.tarefas, "apagou as tarefas sem RUNNING");
+        assert!(!k.c.concluido().exists(), "gravou concluido sem RUNNING");
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// R3, achado 2: a lógica do recuperar.bat, exercitada.
+// ------------------------------------------------------------------------------------
+
+const CONTEUDOS: [Option<&str>; 4] = [None, Some("BOM"), Some("RUIM"), Some("CAI")];
+
+/// Só as três pastas + `troca` (mais leve que `Cenario`).
+struct Mini {
+    raiz: PathBuf,
+    c: Caminhos,
+}
+
+impl Mini {
+    fn novo(estado: [Option<&str>; 3], concluido: bool) -> Self {
+        let raiz = tmp();
+        let c = Caminhos::de(
+            &raiz.join("PF").join("SuporteVancin"),
+            &raiz.join("PD").join("atualizacao"),
+        );
+        fs::create_dir_all(&c.troca).unwrap();
+        for (p, v) in Pasta::TODAS.iter().zip(estado) {
+            if let Some(v) = v {
+                escrever(&c.pasta(*p).join(EXE), &format!("{v} {p:?}"));
+            }
+        }
+        if concluido {
+            fs::write(c.concluido(), "ok").unwrap();
+        }
+        Self { raiz, c }
+    }
+}
+
+impl Drop for Mini {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.raiz);
+    }
+}
+
+fn recuperar_conferindo(c: &Caminhos, s: &mut Falso) -> Saida {
+    executar(&programa_recuperar(), c, EXE, s, &T0, &mut |i, p| {
+        assert!(alguma_utilizavel(c), "passo {i} ({p:?}) deixou sem instalação utilizável");
+    })
+}
+
+/// Todos os estados iniciais (cada pasta ausente/boa/ruim/sobe-e-cai, com e sem `concluido`),
+/// todos os padrões de falha de `ren` (0, 1 = passageira, 99 = permanente) por pasta, serviço
+/// parado ou rodando: a invariante vale em todo passo; `Concluida` só com a atual utilizável,
+/// RUNNING, `concluido` gravado e tarefas apagadas; `Pendente` mantém as tarefas e não grava
+/// `concluido`; a anterior boa nunca é destruída; com `concluido`, nada é renomeado.
+#[test]
+fn recuperacao_exaustiva() {
+    let mut casos = 0;
+    let mut concluidas = 0;
+    for a in CONTEUDOS {
+        for b in CONTEUDOS {
+            for f in CONTEUDOS {
+                let estado = [a, b, f];
+                if estado.iter().all(Option::is_none) {
+                    continue; // fora da invariante desde o início
+                }
+                for concluido in [false, true] {
+                    for padrao in 0..27usize {
+                        let falhas = [padrao % 3, padrao / 3 % 3, padrao / 9].map(|i| [0, 1, 99][i]);
+                        for inicial in [Servico::Rodando, Servico::Parado] {
+                            casos += 1;
+                            let m = Mini::novo(estado, concluido);
+                            let mut s = Falso::novo(&m.c);
+                            s.estado = inicial;
+                            for (p, n) in Pasta::TODAS.iter().zip(falhas) {
+                                if n > 0 {
+                                    s.falhas_renomear.insert(m.c.pasta(*p).to_owned(), n);
+                                }
+                            }
+                            let anterior = ler(&m.c.anterior.join(EXE));
+                            let saida = recuperar_conferindo(&m.c, &mut s);
+                            let ctx = format!(
+                                "{estado:?} concluido={concluido} falhas={falhas:?} {inicial:?} -> {saida:?} {:?}",
+                                s.eventos()
+                            );
+                            match saida {
+                                Saida::Concluida => {
+                                    concluidas += 1;
+                                    assert!(m.c.atual.join(EXE).is_file(), "{ctx}");
+                                    assert_eq!(s.estado, Servico::Rodando, "{ctx}");
+                                    assert!(m.c.concluido().is_file(), "{ctx}");
+                                    assert!(!s.tarefas, "{ctx}");
+                                }
+                                Saida::Pendente => {
+                                    assert!(s.tarefas, "apagou tarefas: {ctx}");
+                                    assert_eq!(m.c.concluido().exists(), concluido, "{ctx}");
+                                }
+                            }
+                            if anterior.starts_with("BOM") && !concluido {
+                                assert!(
+                                    Pasta::TODAS
+                                        .iter()
+                                        .any(|p| ler(&m.c.pasta(*p).join(EXE)) == anterior),
+                                    "a anterior boa sumiu: {ctx}"
+                                );
+                            }
+                            if concluido && a.is_some() {
+                                assert!(!s.eventos().iter().any(|e| e.starts_with("ren")), "{ctx}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(casos, 63 * 2 * 27 * 2);
+    assert!(concluidas > 0 && concluidas < casos);
+}
+
+/// Estados que uma troca interrompida deixa (a anterior boa em `.anterior`), com o `ren`
+/// bloqueado por um tempo: cada disparo da tarefa fica `Pendente` sem estragar nada e, quando
+/// o bloqueio some, converge para a anterior no lugar e o serviço rodando.
+#[test]
+fn recuperacao_repetida_converge_quando_o_bloqueio_some() {
+    let estados = [
+        [None, Some("BOM"), None],
+        [Some("RUIM"), Some("BOM"), None],
+        [Some("CAI"), Some("BOM"), None],
+        [None, Some("BOM"), Some("RUIM")],
+        [Some("RUIM"), Some("BOM"), Some("CAI")],
+    ];
+    for estado in estados {
+        for bloqueada in [Pasta::Atual, Pasta::Anterior, Pasta::Falhou] {
+            let m = Mini::novo(estado, false);
+            let mut s = Falso::novo(&m.c);
+            s.estado = Servico::Parado;
+            s.falhas_renomear.insert(m.c.pasta(bloqueada).to_owned(), 99);
+            let mut saidas = vec![];
+            for disparo in 0..6 {
+                if disparo == 3 {
+                    s.falhas_renomear.clear(); // antivírus soltou a pasta
+                }
+                let saida = recuperar_conferindo(&m.c, &mut s);
+                saidas.push(saida);
+                if saida == Saida::Concluida {
+                    break;
+                }
+            }
+            let ctx = format!("{estado:?} bloqueada={bloqueada:?} {saidas:?} {:?}", s.eventos());
+            assert_eq!(saidas.last(), Some(&Saida::Concluida), "{ctx}");
+            assert_eq!(ler(&m.c.atual.join(EXE)), "BOM Anterior", "{ctx}");
+            assert_eq!(s.estado, Servico::Rodando, "{ctx}");
+            assert!(!s.tarefas, "{ctx}");
+        }
+    }
+}
+
+fn queda(r: std::thread::Result<impl Sized>) -> bool {
+    match r {
+        Ok(_) => false,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            assert_eq!(msg, "queda de energia simulada", "pânico que não é a queda simulada");
+            true
+        }
+    }
+}
+
+/// Queda de energia em cada operação da troca e, depois do boot, em cada passo da
+/// recuperação; uma última recuperação completa sempre termina com a 1.0.6 (ou a 1.0.7 boa)
+/// no lugar, o serviço RUNNING e as tarefas apagadas. A invariante é conferida em todo `ren`
+/// e em todo passo.
+#[test]
+fn queda_de_energia_em_cada_ponto_da_troca_e_da_recuperacao() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let passos = programa_recuperar().len() as u32;
+    for novo in ["RUIM 1.0.7", "CAI 1.0.7", "BOM 1.0.7"] {
+        let total = {
+            let k = Cenario::novo(novo);
+            let mut s = Falso::novo(&k.c);
+            s.vida = Some(u32::MAX);
+            k.rodar(&mut copiar_arquivo, &mut validar_ok, &mut s);
+            u32::MAX - s.vida.unwrap()
+        };
+        assert!(total > 10, "{novo}: {total}");
+        for k1 in 0..total {
+            // k2 = passos: recuperação sem queda
+            for k2 in (0..=passos).step_by(if k1 % 4 == 0 { 1 } else { 7 }) {
+                let k = Cenario::novo(novo);
+                let mut s = Falso::novo(&k.c);
+                s.vida = Some(k1);
+                let caiu = queda(catch_unwind(AssertUnwindSafe(|| {
+                    k.rodar(&mut copiar_arquivo, &mut validar_ok, &mut s)
+                })));
+                assert!(caiu, "{novo} k1={k1}");
+                assert!(alguma_utilizavel(&k.c), "{novo} k1={k1}");
+                // boot: serviço parado; tarefa ao iniciar, que também pode cair
+                let mut s2 = Falso::novo(&k.c);
+                s2.estado = Servico::Parado;
+                let mut n = 0u32;
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    executar(&programa_recuperar(), &k.c, EXE, &mut s2, &T0, &mut |i, p| {
+                        assert!(alguma_utilizavel(&k.c), "passo {i} {p:?}");
+                        n += 1;
+                        if n == k2 {
+                            panic!("queda de energia simulada");
+                        }
+                    })
+                }));
+                let primeira = if queda(r) { None } else { Some(()) };
+                let mut s3 = Falso::novo(&k.c);
+                s3.estado = Servico::Parado;
+                let saida = recuperar_conferindo(&k.c, &mut s3);
+                let ctx = format!("{novo} k1={k1} k2={k2} 1a={primeira:?} {:?}", s3.eventos());
+                assert_eq!(saida, Saida::Concluida, "{ctx}");
+                assert_eq!(s3.estado, Servico::Rodando, "{ctx}");
+                assert!(!s3.tarefas, "{ctx}");
+                let exe = ler(&k.c.atual.join(EXE));
+                if novo.starts_with("BOM") {
+                    assert!(exe.starts_with("BOM"), "{ctx}: {exe}");
+                } else {
+                    assert_eq!(exe, "BOM 1.0.6", "{ctx}");
+                    assert_eq!(ler(&k.c.atual.join("custom.txt")), "config embutida", "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn programa_invalido_e_recusado() {
+    use Passo::*;
+    assert!(validar_programa(&programa_recuperar()).is_ok());
+    assert!(validar_programa(&[Ir("x"), Sair(Saida::Pendente)]).is_err());
+    assert!(validar_programa(&[Rotulo("a"), Rotulo("a"), Sair(Saida::Pendente)]).is_err());
+    assert!(validar_programa(&[Rotulo("a&b"), Sair(Saida::Pendente)]).is_err());
+    assert!(validar_programa(&[Log("x>y"), Sair(Saida::Pendente)]).is_err());
+    assert!(validar_programa(&[Log("fim")]).is_err(), "cai do fim");
+}
+
+// ------------------------------------------------------------------------------------
+// Gerador do recuperar.bat: cada passo vira o trecho equivalente.
+// ------------------------------------------------------------------------------------
+
+const TAREFAS: [&str; 2] = [
+    "SuporteVancin-recuperar-atualizacao",
+    "SuporteVancin-recuperar-atualizacao-minuto",
+];
+
+fn bat() -> String {
+    script_recuperar(
+        &caminhos_windows(),
+        "SuporteVancin",
+        "RuntimeBroker_rustdesk.exe",
+        &TAREFAS,
+        &Tempos::PADRAO,
+    )
+    .unwrap()
+}
+
+fn linhas(s: &str) -> Vec<&str> {
+    s.split("\r\n").collect()
 }
 
 fn linha(s: &str, trecho: &str) -> usize {
@@ -474,8 +970,145 @@ fn linha(s: &str, trecho: &str) -> usize {
 }
 
 #[test]
+fn bat_todo_goto_tem_rotulo_e_todo_rotulo_do_programa_existe() {
+    let b = bat();
+    let ls = linhas(&b);
+    let rotulos: Vec<&str> = ls.iter().filter_map(|l| l.strip_prefix(':')).collect();
+    let mut unicos = rotulos.clone();
+    unicos.sort();
+    unicos.dedup();
+    assert_eq!(unicos.len(), rotulos.len(), "rótulo repetido");
+    for l in &ls {
+        if let Some(i) = l.find("goto ") {
+            let alvo = l[i + 5..].split_whitespace().next().unwrap();
+            assert!(rotulos.contains(&alvo), "goto sem rótulo: {l}");
+        }
+        if let Some(i) = l.find("call :") {
+            let alvo = l[i + 6..].split_whitespace().next().unwrap();
+            assert!(rotulos.contains(&alvo), "call sem rótulo: {l}");
+        }
+    }
+    for p in programa_recuperar() {
+        if let Passo::Rotulo(r) = p {
+            assert!(rotulos.contains(&r), "{r}");
+        }
+    }
+    assert!(!ls.iter().any(|l| l.trim_start().starts_with("move ")));
+    assert!(b.contains(r#"set "ATUAL=C:/Program Files/SuporteVancin""#));
+    assert!(b.contains(r#"set "TROCA=C:/ProgramData/SuporteVancin/atualizacao""#));
+}
+
+/// Recuperação serializada: o corpo só roda com o descritor 9 em `recuperar.lock`; sem a
+/// trava, sai com 3 sem tocar em nada. `:principal` não é alcançável por queda.
+#[test]
+fn bat_corpo_so_roda_com_a_trava() {
+    let b = bat();
+    let ls = linhas(&b);
+    let chama = linha(&b, r#"call :principal 9>"%TROCA%\recuperar.lock""#);
+    let sai = linha(&b, "exit /b %SAIDA%");
+    let corpo = ls.iter().position(|l| *l == ":principal").unwrap();
+    assert!(linha(&b, r#"set "SAIDA=3""#) < chama && chama < sai && sai + 1 == corpo);
+    // nada antes da trava mexe em serviço, pasta ou tarefa
+    for l in &ls[..corpo] {
+        for proibido in ["sc ", "ren ", "rd ", "schtasks", "taskkill"] {
+            assert!(!l.contains(proibido), "{l}");
+        }
+    }
+}
+
+/// `schtasks /Delete` e `concluido` só são alcançáveis passando pela confirmação de RUNNING
+/// estável: o rótulo imediatamente anterior é o fim do laço de estabilidade, que só é
+/// alcançado depois de `find "RUNNING"` ter dado certo, e não há queda para dentro dele.
+#[test]
+fn bat_so_apaga_tarefas_e_conclui_depois_de_running_estavel() {
+    let b = bat();
+    let ls = linhas(&b);
+    let alvos: Vec<usize> = ls
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("schtasks /Delete") || l.contains("echo ok>"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(alvos.len(), 3, "2 tarefas + concluido");
+    for i in alvos {
+        let r = (0..i).rev().find(|j| ls[*j].starts_with(':')).unwrap();
+        let rot = &ls[r][1..];
+        let k = rot.strip_suffix("_fim").unwrap_or_else(|| panic!("{} vem de {rot}", ls[i]));
+        // entre o rótulo e a linha só há marcar concluido / apagar tarefas (sem saltos)
+        for l in &ls[r + 1..i] {
+            assert!(
+                l.contains("echo ok>") || l.contains("if not exist \"%TROCA%\\concluido\" goto pendente") || l.contains("schtasks /Delete"),
+                "{l}"
+            );
+        }
+        assert_eq!(ls[r - 1], format!("goto {k}_e"), "queda para dentro de {rot}");
+        let gotos: Vec<&&str> = ls.iter().filter(|l| l.ends_with(&format!("goto {rot}"))).collect();
+        assert_eq!(gotos, vec![&format!("if %N% GEQ 20 goto {rot}").as_str()]);
+        let e = ls.iter().position(|l| *l == format!(":{k}_e")).unwrap();
+        let ok = ls.iter().position(|l| *l == format!(":{k}_ok")).unwrap();
+        assert_eq!(ls[e + 1], format!("if %N% GEQ 20 goto {rot}"));
+        assert_eq!(ls[e + 3], r#"sc query "SuporteVancin" | find "RUNNING" >nul || goto pendente"#);
+        assert_eq!(ls[ok - 1], format!("goto {k}"), "queda para dentro de {k}_ok");
+        let entra_ok: Vec<&&str> = ls.iter().filter(|l| l.ends_with(&format!("goto {k}_ok"))).collect();
+        assert_eq!(
+            entra_ok,
+            vec![&format!(r#"sc query "SuporteVancin" | find "RUNNING" >nul && goto {k}_ok"#).as_str()]
+        );
+    }
+    // a única partida do serviço é a do passo SubirEstavel
+    assert_eq!(ls.iter().filter(|l| l.contains("sc start")).count(), 1);
+}
+
+#[test]
+fn bat_cada_ren_confere_resultado_e_destino() {
+    let b = bat();
+    let ls = linhas(&b);
+    let ren: Vec<usize> = (0..ls.len()).filter(|i| ls[*i].starts_with("call :ren ")).collect();
+    let n = programa_recuperar()
+        .iter()
+        .filter(|p| matches!(p, Passo::Renomear { .. }))
+        .count();
+    assert_eq!(ren.len(), n);
+    for i in ren {
+        assert!(ls[i + 1].starts_with("if errorlevel 1 goto "), "{}", ls[i + 1]);
+        assert!(ls[i + 2].starts_with("if not exist \"%"), "{}", ls[i + 2]);
+    }
+    let sub = ls.iter().position(|l| *l == ":ren").unwrap();
+    assert_eq!(ls[sub + 1], r#"if exist "%~3" exit /b 1"#);
+    assert!(b.contains("if %R% GEQ 20 exit /b 1"));
+    // trecho do passo "anterior volta; se não voltar, a que falhou volta" (achado 2)
+    let restaurar = linha(&b, r#"call :ren "%ANTERIOR%" "SuporteVancin" "%ATUAL%""#);
+    assert_eq!(ls[restaurar + 1], "if errorlevel 1 goto devolver");
+    let devolver = ls.iter().position(|l| *l == ":devolver").unwrap();
+    assert!(ls[devolver..]
+        .iter()
+        .take(8)
+        .any(|l| *l == r#"call :ren "%FALHOU%" "SuporteVancin" "%ATUAL%""#));
+}
+
+#[test]
+fn bat_segue_os_tempos() {
+    let t = Tempos {
+        passo: Duration::from_secs(1),
+        parar: 7,
+        subir: 8,
+        estavel: 9,
+        renomear: 4,
+    };
+    let b = script_recuperar(&caminhos_windows(), "A", "B", &["T"], &t).unwrap();
+    for trecho in [
+        "if %N% GEQ 7 goto",
+        "if %N% GEQ 8 goto pendente",
+        "if %N% GEQ 9 goto",
+        "if %R% GEQ 4 exit /b 1",
+    ] {
+        assert!(b.contains(trecho), "{trecho}");
+    }
+}
+
+#[test]
 fn script_guarda_espera_o_processo_antes_de_recuperar() {
-    let c = Caminhos::de(Path::new("C:/Program Files/SuporteVancin"));
+    let c = caminhos_windows();
     let g = script_guarda(&c, 4242, 240).unwrap();
     assert!(g.contains("\r\n"));
     let concl = linha(&g, r#"if exist "%TROCA%\concluido" exit /b 0"#);
@@ -488,29 +1121,15 @@ fn script_guarda_espera_o_processo_antes_de_recuperar() {
 }
 
 #[test]
-fn script_recuperar_segue_a_tabela() {
-    let c = Caminhos::de(Path::new("C:/Program Files/SuporteVancin"));
-    let r = script_recuperar(&c, "SuporteVancin", "RuntimeBroker_rustdesk.exe", "SuporteVancin-recuperar").unwrap();
-    let concl = linha(&r, r#"if exist "%TROCA%\concluido" goto garantir"#);
-    let sem_ant = linha(&r, r#"if not exist "%ANTERIOR%\SuporteVancin.exe" goto garantir"#);
-    let parar = linha(&r, r#"sc stop "SuporteVancin""#);
-    let tira = linha(&r, r#"if exist "%ATUAL%" call :ren "%ATUAL%" "SuporteVancin.falhou""#);
-    let volta = linha(&r, r#"if not exist "%ATUAL%" call :ren "%ANTERIOR%" "SuporteVancin""#);
-    let start = linha(&r, r#"sc start "SuporteVancin""#);
-    assert!(concl < sem_ant && sem_ant < parar && parar < tira && tira < volta && volta < start);
-    assert!(r.contains(r#"schtasks /Delete /F /TN "SuporteVancin-recuperar""#));
-    // `move` aninharia a pasta se o destino existisse; só `ren`
-    assert!(!r.lines().any(|l| l.trim_start().starts_with("move ")));
-    assert!(r.contains(r#"set "ATUAL=C:/Program Files/SuporteVancin""#));
-}
-
-#[test]
 fn scripts_recusam_caracteres_do_cmd() {
     for ruim in ["C:/A%B/X", "C:/A&B/X", "C:/A!B/X", "C:/A\"B/X", "C:/A^B/X"] {
-        let c = Caminhos::de(Path::new(ruim));
+        let c = Caminhos::de(Path::new(ruim), Path::new("C:/PD/x"));
+        assert!(script_recuperar(&c, "A", "B", &["C"], &T0).is_err(), "{ruim}");
+        let c = Caminhos::de(Path::new("C:/ok"), Path::new(ruim));
         assert!(script_guarda(&c, 1, 1).is_err(), "{ruim}");
-        assert!(script_recuperar(&c, "A", "B", "C").is_err(), "{ruim}");
+        assert!(script_recuperar(&c, "A", "B", &["C"], &T0).is_err(), "{ruim}");
     }
-    let c = Caminhos::de(Path::new("C:/ok"));
-    assert!(script_recuperar(&c, "A&B", "B", "C").is_err());
+    let c = caminhos_windows();
+    assert!(script_recuperar(&c, "A&B", "B", &["C"], &T0).is_err());
+    assert!(script_recuperar(&c, "A", "B", &["C|D"], &T0).is_err());
 }

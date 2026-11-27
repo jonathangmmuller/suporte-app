@@ -7,7 +7,10 @@
 //!   `<inst>.novo`      nova instalação montada e conferida ANTES de parar o serviço
 //!   `<inst>.anterior`  instalação anterior, íntegra (é só renomeada, nunca sobrescrita)
 //!   `<inst>.falhou`    nova instalação que não subiu (fica para diagnóstico)
-//!   `<inst>.troca`     scripts da guarda/recuperação e o marcador `concluido`
+//! e, fora da pasta de programas (`%ProgramData%\<App>\atualizacao`, DACL protegida):
+//!   `troca`            scripts da guarda/recuperação, trava, log e o marcador `concluido`
+//!
+//! Só atualiza quando a instalação, a pasta-mãe e os ancestrais estão protegidos (`acl`).
 //!
 //! 1. `preparar`: `<inst>.novo` = cópia da instalação atual + arquivos da versão nova por cima
 //!    (mesma semântica do XCOPY antigo, que preservava arquivos extras), com sha256 de cada
@@ -18,20 +21,30 @@
 //!    exige que fique `RUNNING` por um tempo. Qualquer falha devolve a anterior e sobe o
 //!    serviço dela.
 //! 4. Fora do processo (Windows): uma guarda (`guarda.bat`) espera ESTE processo terminar e só
-//!    então, se não houver `concluido`, roda `recuperar.bat` (mesma tabela de `recuperar`).
-//!    Uma tarefa agendada "ao iniciar" roda o mesmo `recuperar.bat` se a máquina reiniciar no
-//!    meio. A guarda nunca age enquanto a troca está em andamento (espera o PID sair).
+//!    então, se não houver `concluido`, roda `recuperar.bat`. Duas tarefas agendadas (SYSTEM,
+//!    "ao iniciar" e "a cada minuto") rodam o mesmo `recuperar.bat`. Uma trava de arquivo
+//!    (`recuperar.lock`, também segurada por este processo durante toda a troca) impede duas
+//!    execuções ao mesmo tempo. As tarefas só são apagadas depois de o serviço ficar RUNNING;
+//!    até lá, a recuperação é repetida.
+//! 5. A lógica do `recuperar.bat` é um programa (`programa_recuperar`, lista de `Passo`) com
+//!    dois consumidores: `executar` (interpretador sobre `Sistema` e pastas reais, usado nos
+//!    testes) e `script_recuperar` (gera o BAT, passo a passo). Os testes exercitam a lógica
+//!    que vira BAT, e não o texto dele.
+
+pub(crate) mod acl;
 
 use hbb_common::{anyhow::anyhow, bail, log, ResultType};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 pub(crate) const MARCADOR_CONCLUIDO: &str = "concluido";
+pub(crate) const TRAVA: &str = "recuperar.lock";
+pub(crate) const SCRIPT_RECUPERAR: &str = "recuperar.bat";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caminhos {
@@ -43,7 +56,9 @@ pub(crate) struct Caminhos {
 }
 
 impl Caminhos {
-    pub fn de(atual: &Path) -> Self {
+    /// `troca`: pasta da recuperação, fora da pasta de programas
+    /// (`%ProgramData%\<App>\atualizacao` no Windows).
+    pub fn de(atual: &Path, troca: &Path) -> Self {
         let irmao = |suf: &str| {
             let mut s = atual.as_os_str().to_owned();
             s.push(suf);
@@ -54,7 +69,7 @@ impl Caminhos {
             novo: irmao(".novo"),
             anterior: irmao(".anterior"),
             falhou: irmao(".falhou"),
-            troca: irmao(".troca"),
+            troca: troca.to_owned(),
         }
     }
 
@@ -62,9 +77,31 @@ impl Caminhos {
         self.troca.join(MARCADOR_CONCLUIDO)
     }
 
-    /// Apaga restos de uma atualização anterior (já concluída: o serviço que nos chamou roda
-    /// da instalação atual). Nunca toca a instalação atual.
+    pub fn pasta(&self, p: Pasta) -> &Path {
+        match p {
+            Pasta::Atual => &self.atual,
+            Pasta::Anterior => &self.anterior,
+            Pasta::Falhou => &self.falhou,
+        }
+    }
+
+    /// Uma troca anterior começou e não terminou (`troca` sem `concluido`): a recuperação
+    /// (guarda/tarefas) ainda é dona das pastas.
+    pub fn recuperacao_pendente(&self) -> bool {
+        fs::symlink_metadata(&self.troca).is_ok() && !self.concluido().exists()
+    }
+
+    /// Apaga restos de uma atualização anterior já concluída. Nunca toca a instalação atual.
+    /// Recusa se a recuperação estiver pendente: `.anterior`/`.falhou` podem ser a única cópia
+    /// boa, e os scripts dela estão em `troca`.
     pub fn limpar_restos(&self) -> ResultType<()> {
+        if self.recuperacao_pendente() {
+            bail!(
+                "recuperação de uma troca anterior pendente ({:?} sem {}); não atualizo",
+                self.troca,
+                MARCADOR_CONCLUIDO
+            );
+        }
         for d in [&self.novo, &self.anterior, &self.falhou, &self.troca] {
             remover_arvore(d)?;
         }
@@ -105,6 +142,13 @@ pub(crate) struct Preparo<'a> {
     pub extras: &'a [(PathBuf, String)],
     /// Arquivos a não levar para a nova instalação (ex.: `meta.toml`).
     pub remover: &'a [&'a str],
+    /// Cria `.novo` (deve falhar se já existir). No Windows: `acl::criar_pasta_protegida`.
+    pub criar_novo: fn(&Path) -> io::Result<()>,
+}
+
+/// `criar_novo` sem ACL (testes e sistemas não Windows).
+pub(crate) fn criar_pasta(p: &Path) -> io::Result<()> {
+    fs::create_dir(p)
 }
 
 /// Lista arquivos regulares (relativos) de `raiz`, sem seguir links.
@@ -156,7 +200,8 @@ fn preparar_dentro(
     if !p.origem.join(p.exe_origem).is_file() {
         bail!("versão nova sem {}", p.exe_origem);
     }
-    fs::create_dir_all(&c.novo)?;
+    // Já com a DACL final (subpastas e arquivos herdam); falha se alguém a recriou no meio.
+    (p.criar_novo)(&c.novo).map_err(|e| anyhow!("criar {:?}: {}", c.novo, e))?;
     // destino relativo -> arquivo de origem (o último vence: atual, depois nova, depois extras)
     let mut plano: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for r in listar(&c.atual)? {
@@ -217,8 +262,11 @@ pub(crate) trait Sistema {
     fn iniciar_servico(&mut self);
     /// Encerra os processos do app (menos este) que podem travar a pasta.
     fn encerrar_processos(&mut self);
+    /// Falha se `para` existir (como o `ren` do cmd).
     fn renomear(&mut self, de: &Path, para: &Path) -> io::Result<()>;
     fn esperar(&mut self, d: Duration);
+    /// Apaga as tarefas agendadas da recuperação.
+    fn apagar_tarefas(&mut self);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -319,13 +367,22 @@ fn subir_estavel(s: &mut dyn Sistema, t: &Tempos) -> bool {
     true
 }
 
-fn garantir_servico(s: &mut dyn Sistema, t: &Tempos) -> bool {
-    s.iniciar_servico();
-    esperar_estado(s, Servico::Rodando, t.subir, t)
+/// Religa (se o serviço estava rodando antes) e exige RUNNING estável. Partida não
+/// confirmada = `Critico`: fica para a guarda/tarefas e ninguém grava `concluido`.
+fn religado(s: &mut dyn Sistema, religar: bool, t: &Tempos, r: Resultado) -> Resultado {
+    if !religar || subir_estavel(s, t) {
+        return r;
+    }
+    let antes = match r {
+        Resultado::Atualizado => "atualizado".to_owned(),
+        Resultado::NaoTrocado(m) | Resultado::Revertido(m) | Resultado::Critico(m) => m,
+    };
+    Resultado::Critico(format!("{antes}; serviço não confirmou RUNNING"))
 }
 
 /// Troca `c.atual` por `c.novo` (já preparado e conferido). `religar`: o serviço estava
-/// rodando antes e precisa estar rodando depois.
+/// rodando antes e precisa estar rodando depois. Toda partida é confirmada (`subir_estavel`);
+/// sem confirmação o resultado é `Critico`.
 pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempos) -> Resultado {
     s.parar_servico();
     if !esperar_estado(s, Servico::Parado, t.parar, t) {
@@ -335,18 +392,14 @@ pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempo
 
     if let Err(e) = renomear_tentando(s, &c.atual, &c.anterior, t.renomear, t) {
         // Nada mudou no disco.
-        if religar {
-            garantir_servico(s, t);
-        }
-        return Resultado::NaoTrocado(format!("instalação atual presa: {e}"));
+        let r = Resultado::NaoTrocado(format!("instalação atual presa: {e}"));
+        return religado(s, religar, t, r);
     }
     if let Err(e) = renomear_tentando(s, &c.novo, &c.atual, t.renomear, t) {
         return match renomear_tentando(s, &c.anterior, &c.atual, t.renomear * 3, t) {
             Ok(()) => {
-                if religar {
-                    garantir_servico(s, t);
-                }
-                Resultado::NaoTrocado(format!("nova instalação não entrou no lugar: {e}"))
+                let r = Resultado::NaoTrocado(format!("nova instalação não entrou no lugar: {e}"));
+                religado(s, religar, t, r)
             }
             Err(e2) => Resultado::Critico(format!(
                 "nova não entrou ({e}) e a anterior não voltou ({e2})"
@@ -367,28 +420,36 @@ pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempo
     }
     if let Err(e) = renomear_tentando(s, &c.atual, &c.falhou, t.renomear * 3, t) {
         // A nova continua no lugar; ao menos tenta subir.
-        garantir_servico(s, t);
+        subir_estavel(s, t);
         return Resultado::Critico(format!("versão nova não subiu e não saiu do lugar: {e}"));
     }
     if let Err(e) = renomear_tentando(s, &c.anterior, &c.atual, t.renomear * 3, t) {
         // Não deixa a pasta vazia: devolve a nova e tenta subir.
         let _ = renomear_tentando(s, &c.falhou, &c.atual, t.renomear * 3, t);
-        garantir_servico(s, t);
+        subir_estavel(s, t);
         return Resultado::Critico(format!("anterior não voltou: {e}"));
     }
-    if garantir_servico(s, t) {
-        Resultado::Revertido("serviço da versão nova não ficou RUNNING".to_owned())
-    } else {
-        Resultado::Critico("anterior restaurada mas o serviço não subiu".to_owned())
-    }
+    let r = Resultado::Revertido("serviço da versão nova não ficou RUNNING".to_owned());
+    religado(s, true, t, r)
+}
+
+/// Pontos em que a proteção das pastas é conferida de novo (achado 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Momento {
+    /// `.novo` montado; antes de executar o EXE dele.
+    AntesDeExecutar,
+    /// Guarda e tarefas prontas; antes de parar o serviço e trocar.
+    AntesDeTrocar,
 }
 
 /// Fluxo completo: prepara e confere `.novo`, prepara a guarda (`antes_de_parar`) e só então
-/// troca. Falha antes da troca não toca o serviço nem a instalação atual.
+/// troca. Falha antes da troca não toca o serviço nem a instalação atual. `conferir` refaz a
+/// conferência de ACL/reparse/hash nos `Momento`s; erro = não troca.
 pub(crate) fn atualizar(
     c: &Caminhos,
     p: &Preparo,
     copiar: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+    conferir: &mut dyn FnMut(Momento) -> ResultType<()>,
     validar: &mut dyn FnMut(&Path) -> ResultType<()>,
     antes_de_parar: &mut dyn FnMut() -> ResultType<()>,
     s: &mut dyn Sistema,
@@ -397,8 +458,10 @@ pub(crate) fn atualizar(
 ) -> Resultado {
     let antes = preparar(c, p, copiar).and_then(|n| {
         log::info!("[portal-update] nova instalação montada e conferida ({n} arquivos)");
+        conferir(Momento::AntesDeExecutar)?;
         validar(&c.novo.join(p.exe_destino))?;
-        antes_de_parar()
+        antes_de_parar()?;
+        conferir(Momento::AntesDeTrocar)
     });
     if let Err(e) = antes {
         if let Err(e2) = remover_arvore(&c.novo) {
@@ -409,26 +472,230 @@ pub(crate) fn atualizar(
     trocar(c, s, religar, t)
 }
 
-/// Tabela de decisão da recuperação (a mesma do `recuperar.bat`), para quando a troca foi
-/// interrompida: com `concluido` não faz nada além de garantir o serviço.
-pub(crate) fn recuperar(c: &Caminhos, exe: &str, s: &mut dyn Sistema, t: &Tempos) -> bool {
-    if !c.concluido().exists() && c.anterior.join(exe).is_file() {
-        s.parar_servico();
-        esperar_estado(s, Servico::Parado, t.parar, t);
-        s.encerrar_processos();
-        if c.atual.exists() {
-            let _ = remover_arvore(&c.falhou);
-            if let Err(e) = renomear_tentando(s, &c.atual, &c.falhou, t.renomear, t) {
-                log::error!("[portal-update] recuperação: {:?} presa: {}", c.atual, e);
-            }
+// ---------------------------------------------------------------------------------------
+// Recuperação: programa único, interpretado nos testes e convertido em `recuperar.bat`.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Pasta {
+    Atual,
+    Anterior,
+    Falhou,
+}
+
+impl Pasta {
+    pub const TODAS: [Pasta; 3] = [Pasta::Atual, Pasta::Anterior, Pasta::Falhou];
+    fn var(self) -> &'static str {
+        match self {
+            Pasta::Atual => "ATUAL",
+            Pasta::Anterior => "ANTERIOR",
+            Pasta::Falhou => "FALHOU",
         }
-        if !c.atual.exists() {
-            if let Err(e) = renomear_tentando(s, &c.anterior, &c.atual, t.renomear, t) {
-                log::error!("[portal-update] recuperação: anterior não voltou: {}", e);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cond {
+    Concluido,
+    Existe(Pasta),
+    /// A pasta tem o EXE do app (instalação utilizável).
+    ExisteExe(Pasta),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Saida {
+    /// Serviço RUNNING estável, `concluido` gravado e conferido, tarefas apagadas.
+    Concluida,
+    /// Não deu para garantir: tarefas mantidas, sem `concluido`; repete no próximo disparo.
+    Pendente,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Passo {
+    Rotulo(&'static str),
+    /// `if [not] <cond> goto ir`
+    Se { cond: Cond, nao: bool, ir: &'static str },
+    Ir(&'static str),
+    Log(&'static str),
+    /// Para o serviço, espera STOPPED (`Tempos::parar`) e encerra os processos do app.
+    PararServico,
+    /// `rd /s /q` (erro ignorado: o `Renomear` seguinte falha se a pasta ficou).
+    Apagar(Pasta),
+    /// `ren` com novas tentativas; falha se o destino existir; confere o destino depois.
+    Renomear { de: Pasta, para: Pasta, falha: &'static str },
+    /// Sobe o serviço e exige RUNNING estável (`subir_estavel`).
+    SubirEstavel { falha: &'static str },
+    /// Grava `concluido` e confere que ficou.
+    MarcarConcluido { falha: &'static str },
+    ApagarTarefas,
+    Sair(Saida),
+}
+
+/// Tabela da recuperação. Invariante: nenhum passo deixa as três pastas sem o EXE (só
+/// renomeia uma pasta para um nome livre; só apaga `.falhou` quando `.anterior` tem o EXE).
+pub(crate) fn programa_recuperar() -> Vec<Passo> {
+    use Cond::*;
+    use Pasta::*;
+    use Passo::*;
+    vec![
+        Log("inicio"),
+        // `concluido` só dispensa a tabela se a atual estiver utilizável.
+        Se { cond: Concluido, nao: true, ir: "tabela" },
+        Se { cond: ExisteExe(Atual), nao: false, ir: "garantir" },
+        Rotulo("tabela"),
+        Se { cond: ExisteExe(Anterior), nao: true, ir: "sem_anterior" },
+        // Troca interrompida: volta a anterior.
+        PararServico,
+        Se { cond: Existe(Atual), nao: true, ir: "restaurar" },
+        Apagar(Falhou),
+        Renomear { de: Atual, para: Falhou, falha: "garantir" },
+        Rotulo("restaurar"),
+        Renomear { de: Anterior, para: Atual, falha: "devolver" },
+        Log("anterior restaurada"),
+        Ir("garantir"),
+        // A anterior não voltou: nunca deixar sem instalação.
+        Rotulo("devolver"),
+        Se { cond: Existe(Atual), nao: false, ir: "garantir" },
+        Se { cond: ExisteExe(Falhou), nao: true, ir: "pendente" },
+        Renomear { de: Falhou, para: Atual, falha: "pendente" },
+        Ir("garantir"),
+        // Sem anterior: a atual é a única; se ela sumiu, a que falhou volta ao lugar.
+        Rotulo("sem_anterior"),
+        Se { cond: Existe(Atual), nao: false, ir: "garantir" },
+        Se { cond: ExisteExe(Falhou), nao: true, ir: "pendente" },
+        Renomear { de: Falhou, para: Atual, falha: "pendente" },
+        Rotulo("garantir"),
+        SubirEstavel { falha: "pendente" },
+        MarcarConcluido { falha: "pendente" },
+        ApagarTarefas,
+        Log("fim"),
+        Sair(Saida::Concluida),
+        Rotulo("pendente"),
+        Log("pendente tarefas mantidas"),
+        Sair(Saida::Pendente),
+    ]
+}
+
+fn nome_simples(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == ' ')
+}
+
+/// Rótulos únicos e simples, todo destino existe, o programa termina em `Sair`/`Ir`.
+pub(crate) fn validar_programa(prog: &[Passo]) -> ResultType<HashMap<&'static str, usize>> {
+    let mut rotulos = HashMap::new();
+    for (i, p) in prog.iter().enumerate() {
+        match p {
+            Passo::Rotulo(r) => {
+                if !nome_simples(r) || r.contains(' ') || r.starts_with('_') {
+                    bail!("rótulo inválido: {r:?}");
+                }
+                if rotulos.insert(*r, i).is_some() {
+                    bail!("rótulo repetido: {r}");
+                }
+            }
+            Passo::Log(m) if !nome_simples(m) => bail!("log inválido: {m:?}"),
+            _ => {}
+        }
+    }
+    for p in prog {
+        let alvo = match p {
+            Passo::Se { ir, .. } | Passo::Ir(ir) => Some(*ir),
+            Passo::Renomear { falha, .. }
+            | Passo::SubirEstavel { falha }
+            | Passo::MarcarConcluido { falha } => Some(*falha),
+            _ => None,
+        };
+        if let Some(a) = alvo {
+            if !rotulos.contains_key(a) {
+                bail!("destino inexistente: {a}");
             }
         }
     }
-    garantir_servico(s, t)
+    if !matches!(prog.last(), Some(Passo::Sair(_) | Passo::Ir(_))) {
+        bail!("programa não termina em Sair/Ir");
+    }
+    Ok(rotulos)
+}
+
+/// Interpretador do programa (mesma semântica de cada passo no BAT). `apos` é chamado depois
+/// de cada passo (os testes conferem a invariante e simulam queda de energia ali).
+pub(crate) fn executar(
+    prog: &[Passo],
+    c: &Caminhos,
+    exe: &str,
+    s: &mut dyn Sistema,
+    t: &Tempos,
+    apos: &mut dyn FnMut(usize, &Passo),
+) -> Saida {
+    let rotulos = validar_programa(prog).expect("programa_recuperar válido");
+    let mut i = 0;
+    let mut contador = 0u32;
+    loop {
+        contador += 1;
+        assert!(contador < 100_000, "programa em laço");
+        let Some(passo) = prog.get(i) else {
+            return Saida::Pendente;
+        };
+        let aqui = i;
+        i += 1;
+        let ir = |r: &str| rotulos[r];
+        match *passo {
+            Passo::Rotulo(_) => {}
+            Passo::Se { cond, nao, ir: r } => {
+                let v = match cond {
+                    Cond::Concluido => c.concluido().exists(),
+                    Cond::Existe(p) => c.pasta(p).exists(),
+                    Cond::ExisteExe(p) => c.pasta(p).join(exe).is_file(),
+                };
+                if v != nao {
+                    i = ir(r);
+                }
+            }
+            Passo::Ir(r) => i = ir(r),
+            Passo::Log(m) => log::info!("[portal-update] recuperar: {m}"),
+            Passo::PararServico => {
+                s.parar_servico();
+                esperar_estado(s, Servico::Parado, t.parar, t);
+                s.encerrar_processos();
+            }
+            Passo::Apagar(p) => {
+                if let Err(e) = remover_arvore(c.pasta(p)) {
+                    log::warn!("[portal-update] recuperar: apagar {:?}: {}", c.pasta(p), e);
+                }
+            }
+            Passo::Renomear { de, para, falha } => {
+                let (de, para) = (c.pasta(de), c.pasta(para));
+                let ok = !para.exists()
+                    && renomear_tentando(s, de, para, t.renomear, t).is_ok()
+                    && para.exists();
+                if !ok {
+                    i = ir(falha);
+                }
+            }
+            Passo::SubirEstavel { falha } => {
+                if !subir_estavel(s, t) {
+                    i = ir(falha);
+                }
+            }
+            Passo::MarcarConcluido { falha } => {
+                let ok = fs::write(c.concluido(), "ok").is_ok() && c.concluido().is_file();
+                if !ok {
+                    i = ir(falha);
+                }
+            }
+            Passo::ApagarTarefas => s.apagar_tarefas(),
+            Passo::Sair(x) => {
+                apos(aqui, passo);
+                return x;
+            }
+        }
+        apos(aqui, passo);
+    }
+}
+
+/// Atalho: roda `programa_recuperar`; `true` = `Saida::Concluida`.
+pub(crate) fn recuperar(c: &Caminhos, exe: &str, s: &mut dyn Sistema, t: &Tempos) -> bool {
+    executar(&programa_recuperar(), c, exe, s, t, &mut |_, _| {}) == Saida::Concluida
 }
 
 /// Caracteres que o cmd interpreta mesmo entre aspas (ou que quebram a linha).
@@ -450,66 +717,152 @@ fn nome_de(p: &Path) -> ResultType<String> {
     ))
 }
 
-/// `recuperar.bat`: transcrição de `recuperar` para o cmd (roda pela guarda ou pela tarefa
-/// agendada ao iniciar, como SYSTEM). Usa `ren` (falha se o destino existir; `move` aninharia).
-pub(crate) fn script_recuperar(c: &Caminhos, app: &str, broker: &str, tarefa: &str) -> ResultType<String> {
-    for v in [app, broker, tarefa] {
+/// Gera `recuperar.bat` a partir de `programa_recuperar` (passo a passo, mesma semântica do
+/// interpretador). Roda pela guarda e pelas tarefas (SYSTEM). Corpo em `:principal`, chamado
+/// com o descritor 9 redirecionado para `recuperar.lock`: se outro processo segura a trava, o
+/// redirecionamento falha, `:principal` não roda e sai com 3 (ocupado). `ren` (não `move`,
+/// que aninharia a pasta se o destino existisse).
+pub(crate) fn script_recuperar(
+    c: &Caminhos,
+    app: &str,
+    broker: &str,
+    tarefas: &[&str],
+    t: &Tempos,
+) -> ResultType<String> {
+    script_de(&programa_recuperar(), c, app, broker, tarefas, t)
+}
+
+pub(crate) fn script_de(
+    prog: &[Passo],
+    c: &Caminhos,
+    app: &str,
+    broker: &str,
+    tarefas: &[&str],
+    t: &Tempos,
+) -> ResultType<String> {
+    for v in [app, broker].iter().chain(tarefas) {
         if !seguro_para_cmd(v) {
             bail!("nome inválido para o cmd: {v:?}");
         }
     }
-    let atual = texto(&c.atual)?;
-    let anterior = texto(&c.anterior)?;
-    let falhou = texto(&c.falhou)?;
-    let troca = texto(&c.troca)?;
-    let nome_atual = nome_de(&c.atual)?;
-    let nome_falhou = nome_de(&c.falhou)?;
-    Ok(format!(
-        r#"@echo off
-setlocal EnableExtensions DisableDelayedExpansion
-cd /d "%SystemRoot%"
-set "ATUAL={atual}"
-set "ANTERIOR={anterior}"
-set "FALHOU={falhou}"
-set "TROCA={troca}"
-echo %DATE% %TIME% recuperar inicio>> "%TROCA%\recuperar.log"
-if exist "%TROCA%\{concluido}" goto garantir
-if not exist "%ANTERIOR%\{app}.exe" goto garantir
-sc stop "{app}" >nul 2>&1
-set /a N=0
-:parar
-sc query "{app}" | find "STOPPED" >nul && goto parado
-set /a N+=1
-if %N% GEQ 30 goto parado
-ping -n 2 127.0.0.1 >nul
-goto parar
-:parado
-taskkill /F /IM "{app}.exe" >nul 2>&1
-taskkill /F /IM "{broker}" >nul 2>&1
-if exist "%ATUAL%" if exist "%FALHOU%" rd /s /q "%FALHOU%"
-if exist "%ATUAL%" call :ren "%ATUAL%" "{nome_falhou}"
-if not exist "%ATUAL%" call :ren "%ANTERIOR%" "{nome_atual}"
-echo %DATE% %TIME% recuperar trocou>> "%TROCA%\recuperar.log"
-:garantir
-sc start "{app}" >nul 2>&1
-schtasks /Delete /F /TN "{tarefa}" >nul 2>&1
-echo ok> "%TROCA%\{concluido}"
-echo %DATE% %TIME% recuperar fim>> "%TROCA%\recuperar.log"
-exit /b 0
-:ren
-set /a R=0
-:ren_loop
-ren "%~1" "%~2" >nul 2>&1 && exit /b 0
-set /a R+=1
-if %R% GEQ 20 exit /b 1
-taskkill /F /IM "{app}.exe" >nul 2>&1
-taskkill /F /IM "{broker}" >nul 2>&1
-ping -n 4 127.0.0.1 >nul
-goto ren_loop
-"#,
-        concluido = MARCADOR_CONCLUIDO,
-    )
-    .replace('\n', "\r\n"))
+    validar_programa(prog)?;
+    let mut o: Vec<String> = Vec::new();
+    let mut l = |s: String| o.push(s);
+    l("@echo off".into());
+    l("setlocal EnableExtensions DisableDelayedExpansion".into());
+    l(r#"cd /d "%SystemRoot%""#.into());
+    for p in Pasta::TODAS {
+        l(format!(r#"set "{}={}""#, p.var(), texto(c.pasta(p))?));
+    }
+    l(format!(r#"set "TROCA={}""#, texto(&c.troca)?));
+    l(r#"set "SAIDA=3""#.into());
+    l(format!(r#"call :principal 9>"%TROCA%\{TRAVA}""#));
+    l(format!(
+        r#"if "%SAIDA%"=="3" echo %DATE% %TIME% ocupado >> "%TROCA%\recuperar.log""#
+    ));
+    l("exit /b %SAIDA%".into());
+    l(":principal".into());
+    let exe = format!("{app}.exe");
+    let parar_processos = [
+        format!(r#"taskkill /F /IM "{exe}" >nul 2>&1"#),
+        format!(r#"taskkill /F /IM "{broker}" >nul 2>&1"#),
+    ];
+    for (i, passo) in prog.iter().enumerate() {
+        let k = format!("_s{i}");
+        match *passo {
+            Passo::Rotulo(r) => l(format!(":{r}")),
+            Passo::Se { cond, nao, ir } => {
+                let alvo = match cond {
+                    Cond::Concluido => format!(r#""%TROCA%\{MARCADOR_CONCLUIDO}""#),
+                    Cond::Existe(p) => format!(r#""%{}%""#, p.var()),
+                    Cond::ExisteExe(p) => format!(r#""%{}%\{exe}""#, p.var()),
+                };
+                let not = if nao { "not " } else { "" };
+                l(format!("if {not}exist {alvo} goto {ir}"));
+            }
+            Passo::Ir(r) => l(format!("goto {r}")),
+            Passo::Log(m) => l(format!(
+                r#"echo %DATE% %TIME% recuperar {m} >> "%TROCA%\recuperar.log""#
+            )),
+            Passo::PararServico => {
+                l(format!(r#"sc stop "{app}" >nul 2>&1"#));
+                l("set /a N=0".into());
+                l(format!(":{k}"));
+                l(format!(r#"sc query "{app}" | find "STOPPED" >nul && goto {k}_ok"#));
+                l(format!("if %N% GEQ {} goto {k}_ok", t.parar));
+                l("set /a N+=1".into());
+                l("ping -n 2 127.0.0.1 >nul".into());
+                l(format!("goto {k}"));
+                l(format!(":{k}_ok"));
+                for p in &parar_processos {
+                    l(p.clone());
+                }
+            }
+            Passo::Apagar(p) => l(format!(r#"if exist "%{0}%" rd /s /q "%{0}%""#, p.var())),
+            Passo::Renomear { de, para, falha } => {
+                l(format!(
+                    r#"call :ren "%{}%" "{}" "%{}%""#,
+                    de.var(),
+                    nome_de(c.pasta(para))?,
+                    para.var()
+                ));
+                l(format!("if errorlevel 1 goto {falha}"));
+                l(format!(r#"if not exist "%{}%" goto {falha}"#, para.var()));
+            }
+            Passo::SubirEstavel { falha } => {
+                l(format!(r#"sc start "{app}" >nul 2>&1"#));
+                l("set /a N=0".into());
+                l(format!(":{k}"));
+                l(format!(r#"sc query "{app}" | find "RUNNING" >nul && goto {k}_ok"#));
+                l(format!("if %N% GEQ {} goto {falha}", t.subir));
+                l("set /a N+=1".into());
+                l("ping -n 2 127.0.0.1 >nul".into());
+                l(format!("goto {k}"));
+                l(format!(":{k}_ok"));
+                l("set /a N=0".into());
+                l(format!(":{k}_e"));
+                l(format!("if %N% GEQ {} goto {k}_fim", t.estavel));
+                l("ping -n 2 127.0.0.1 >nul".into());
+                l(format!(r#"sc query "{app}" | find "RUNNING" >nul || goto {falha}"#));
+                l("set /a N+=1".into());
+                l(format!("goto {k}_e"));
+                l(format!(":{k}_fim"));
+            }
+            Passo::MarcarConcluido { falha } => {
+                l(format!(r#"echo ok> "%TROCA%\{MARCADOR_CONCLUIDO}""#));
+                l(format!(r#"if not exist "%TROCA%\{MARCADOR_CONCLUIDO}" goto {falha}"#));
+            }
+            Passo::ApagarTarefas => {
+                for tn in tarefas {
+                    l(format!(r#"schtasks /Delete /F /TN "{tn}" >nul 2>&1"#));
+                }
+            }
+            Passo::Sair(Saida::Concluida) => {
+                l(r#"set "SAIDA=0""#.into());
+                l("exit /b 0".into());
+            }
+            Passo::Sair(Saida::Pendente) => {
+                l(r#"set "SAIDA=1""#.into());
+                l("exit /b 1".into());
+            }
+        }
+    }
+    // :ren <de> <novo nome> <destino completo>: o destino não pode existir.
+    l(":ren".into());
+    l(r#"if exist "%~3" exit /b 1"#.into());
+    l("set /a R=0".into());
+    l(":ren_loop".into());
+    l(r#"ren "%~1" "%~2" >nul 2>&1 && exit /b 0"#.into());
+    l("set /a R+=1".into());
+    l(format!("if %R% GEQ {} exit /b 1", t.renomear.max(1)));
+    for p in &parar_processos {
+        l(p.clone());
+    }
+    l("ping -n 4 127.0.0.1 >nul".into());
+    l("goto ren_loop".into());
+    let mut s = o.join("\r\n");
+    s.push_str("\r\n");
+    Ok(s)
 }
 
 /// `guarda.bat`: espera o processo da troca (`pid`) terminar; só então, sem `concluido`,
@@ -548,6 +901,8 @@ pub(crate) struct SistemaWindows {
     pub servico: String,
     /// Imagens a encerrar (ex.: `SuporteVancin.exe`, o broker), menos este processo.
     pub imagens: Vec<String>,
+    /// Tarefas agendadas da recuperação.
+    pub tarefas: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -614,6 +969,19 @@ impl Sistema for SistemaWindows {
     }
     fn esperar(&mut self, d: Duration) {
         std::thread::sleep(d);
+    }
+    fn apagar_tarefas(&mut self) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        for t in &self.tarefas {
+            let r = std::process::Command::new("schtasks")
+                .args(["/Delete", "/F", "/TN", t.as_str()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            if !matches!(r, Ok(ref o) if o.status.success()) {
+                log::warn!("[portal-update] não apagou a tarefa {t}");
+            }
+        }
     }
 }
 
