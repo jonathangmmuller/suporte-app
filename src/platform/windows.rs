@@ -3493,6 +3493,10 @@ fn get_directory_size_kb(path: &str) -> u64 {
 }
 
 pub fn update_me(debug: bool) -> ResultType<()> {
+    // App de suporte: troca com volta garantida (ver `updater/troca.rs`).
+    if crate::updater::portal::build_identity().is_some() {
+        return update_me_suporte(debug);
+    }
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
     let (subkey, path, _, exe) = get_install_info();
@@ -3608,23 +3612,10 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    // App de suporte: a máquina não pode ficar sem serviço (inacessível) se este script for
-    // interrompido entre o `sc stop` e o `sc start`. Antes de parar, deixa um processo
-    // destacado que religa o serviço em ~90 s (se já estiver rodando, `sc start` não faz nada);
-    // depois da cópia, confere e tenta de novo.
-    let (service_guard_cmd, restore_service_cmd) = if is_service_running {
-        (
-            format!(
-                "start \"\" /min cmd /d /c \"ping -n 91 127.0.0.1 >nul & sc start {app_name} >nul\""
-            ),
-            format!(
-                "sc start {app_name}
-ping -n 6 127.0.0.1 >nul
-sc query {app_name} | find \"RUNNING\" >nul || sc start {app_name}"
-            ),
-        )
+    let restore_service_cmd = if is_service_running {
+        format!("sc start {}", &app_name)
     } else {
-        ("".to_owned(), "".to_owned())
+        "".to_owned()
     };
 
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
@@ -3654,7 +3645,6 @@ sc query {app_name} | find \"RUNNING\" >nul || sc start {app_name}"
     let cmds = format!(
         "
 chcp 65001
-{service_guard_cmd}
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
 {reg_cmd}
@@ -3735,6 +3725,249 @@ taskkill /F /IM {app_name}.exe{filter}
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");
 
+    Ok(())
+}
+
+/// Atualização do app de suporte: monta e confere a nova instalação ao lado da atual, só
+/// então para o serviço e troca as pastas; se a nova não subir, volta a anterior. Uma guarda
+/// fora deste processo e uma tarefa "ao iniciar" recuperam se a troca for interrompida.
+/// ID, senha permanente e configuração ficam no perfil do serviço e não são tocados.
+fn update_me_suporte(debug: bool) -> ResultType<()> {
+    use crate::updater::troca::{self, Caminhos, Preparo, Resultado, SistemaWindows, Tempos};
+    const NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED: u32 = 0x0000_0008;
+    const NEW_GROUP: u32 = 0x0000_0200;
+    const BREAKAWAY: u32 = 0x0100_0000;
+
+    let app_name = crate::get_app_name();
+    let src_exe = std::env::current_exe()?;
+    let (subkey, path, _, exe) = get_install_info();
+    if std::fs::metadata(&exe).is_err() {
+        bail!("{} is not installed.", &app_name);
+    }
+    let is_msi = is_msi_installed().ok();
+    let reg_msi_key = get_reg_msi_key(&subkey, is_msi)?;
+    let app_exe_name = format!("{}.exe", &app_name);
+    let c = Caminhos::de(Path::new(&path));
+    let origem = src_exe
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {:?}", src_exe))?
+        .to_owned();
+    if origem.starts_with(&c.atual) {
+        bail!("a versão nova precisa rodar de fora da instalação: {:?}", origem);
+    }
+    let exe_origem = src_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(anyhow!("Can't get file name of {:?}", src_exe))?
+        .to_owned();
+    // O EXE montado tem de ser exatamente esta build (marca, variante e versão).
+    let esperado = crate::updater::portal::parse_build_info(&crate::updater::portal::build_info_text(
+        crate::updater::portal::build_identity().as_ref(),
+        config::is_incoming_only(),
+    )?)?
+    .esperado();
+    let tarefa = format!("{app_name}-recuperar-atualizacao");
+    let schtasks = |args: &[&str]| {
+        std::process::Command::new("schtasks")
+            .args(args)
+            .creation_flags(NO_WINDOW)
+            .output()
+    };
+
+    // Restos de uma atualização anterior (já concluída: o serviço roda da instalação atual).
+    let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
+    c.limpar_restos()?;
+
+    // Janela e bandeja (como no upstream); voltam no fim, qualquer que seja o resultado.
+    let main_window_pids =
+        crate::platform::get_pids_of_process_with_args::<_, &str>(&app_exe_name, &[]);
+    let main_window_sessions = main_window_pids
+        .iter()
+        .map(|pid| get_session_id_of_process(pid.as_u32()))
+        .flatten()
+        .collect::<Vec<_>>();
+    let tray_pids = crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
+    let tray_sessions = tray_pids
+        .iter()
+        .map(|pid| get_session_id_of_process(pid.as_u32()))
+        .flatten()
+        .collect::<Vec<_>>();
+    let is_service_running = is_self_service_running();
+    let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
+
+    let extras = vec![(
+        PathBuf::from(win_topmost_window::ORIGIN_PROCESS_EXE),
+        win_topmost_window::INJECTED_PROCESS_EXE.to_owned(),
+    )];
+    let remover: Vec<&str> = if is_msi.unwrap_or(true) && crate::is_custom_client() {
+        vec!["meta.toml"]
+    } else {
+        vec![]
+    };
+    let preparo = Preparo {
+        origem: &origem,
+        exe_origem: &exe_origem,
+        exe_destino: &app_exe_name,
+        extras: &extras,
+        remover: &remover,
+    };
+    let relatorio = std::env::temp_dir().join(format!("{app_name}-build-info-{}.txt", std::process::id()));
+    let mut validar = |novo_exe: &Path| {
+        troca::validar_exe(novo_exe, &relatorio, &esperado, Duration::from_secs(60))
+    };
+    let mut kill_ui = Some((main_window_pids, tray_pids));
+    let mut antes_de_parar = || -> ResultType<()> {
+        std::fs::create_dir_all(&c.troca)?;
+        let recuperar = c.troca.join("recuperar.bat");
+        let guarda = c.troca.join("guarda.bat");
+        std::fs::write(
+            &recuperar,
+            troca::script_recuperar(&c, &app_name, win_topmost_window::INJECTED_PROCESS_EXE, &tarefa)?,
+        )?;
+        std::fs::write(&guarda, troca::script_guarda(&c, std::process::id(), 240)?)?;
+        let recuperar_s = recuperar.to_str().ok_or(anyhow!("caminho inválido"))?;
+        let guarda_s = guarda.to_str().ok_or(anyhow!("caminho inválido"))?;
+        // Reinício no meio da troca: roda a recuperação ao iniciar, como SYSTEM.
+        let out = schtasks(&[
+            "/Create", "/F", "/RU", "SYSTEM", "/RL", "HIGHEST", "/SC", "ONSTART", "/TN", &tarefa,
+            "/TR", &format!("\"{recuperar_s}\""),
+        ])?;
+        if !out.status.success() {
+            bail!(
+                "tarefa de recuperação não criada: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        // Guarda fora deste processo (sobrevive a ele; só age depois que ele sair).
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.raw_arg(format!("/d /c \"\"{guarda_s}\"\""));
+        let filho = cmd
+            .creation_flags(NO_WINDOW | DETACHED | NEW_GROUP | BREAKAWAY)
+            .spawn()
+            .or_else(|_| {
+                std::process::Command::new("cmd")
+                    .raw_arg(format!("/d /c \"\"{guarda_s}\"\""))
+                    .creation_flags(NO_WINDOW | DETACHED | NEW_GROUP)
+                    .spawn()
+            });
+        if let Err(e) = filho {
+            let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
+            bail!("guarda não iniciada: {e}");
+        }
+        // Só agora (tudo pronto) fecha janela e bandeja da versão atual.
+        if let Some((w, t)) = kill_ui.take() {
+            allow_err!(kill_process_by_pids(&app_exe_name, w));
+            allow_err!(kill_process_by_pids(&app_exe_name, t));
+        }
+        Ok(())
+    };
+    let mut sistema = SistemaWindows {
+        servico: app_name.clone(),
+        imagens: vec![
+            app_exe_name.clone(),
+            win_topmost_window::INJECTED_PROCESS_EXE.to_owned(),
+        ],
+    };
+
+    let _restore_session_guard = {
+        let exe = exe.clone();
+        crate::common::SimpleCallOnReturn {
+            b: true,
+            f: Box::new(move || {
+                let is_root = is_root();
+                for s in tray_sessions.clone().into_iter().filter(|s| *s != 0) {
+                    if is_root {
+                        allow_err!(run_exe_in_session(&exe, vec!["--tray"], s, true));
+                    } else {
+                        allow_err!(run_exe_direct(&exe, vec!["--tray"], false));
+                        break;
+                    }
+                }
+                if !main_window_sessions.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                }
+                for s in main_window_sessions.clone().into_iter().filter(|s| *s != 0) {
+                    if is_root {
+                        allow_err!(run_exe_in_session(&exe, vec![], s, true));
+                    } else {
+                        allow_err!(run_exe_direct(&exe, vec![], false));
+                        break;
+                    }
+                }
+            }),
+        }
+    };
+
+    let r = troca::atualizar(
+        &c,
+        &preparo,
+        &mut troca::copiar_arquivo,
+        &mut validar,
+        &mut antes_de_parar,
+        &mut sistema,
+        is_service_running,
+        &Tempos::PADRAO,
+    );
+    let _ = std::fs::remove_file(&relatorio);
+    log::info!("[portal-update] resultado da troca: {:?}", r);
+    if r.consistente() {
+        if c.troca.is_dir() {
+            allow_err!(std::fs::write(c.concluido(), "ok"));
+        }
+        let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
+    }
+    match r {
+        Resultado::Atualizado => {}
+        Resultado::NaoTrocado(m) | Resultado::Revertido(m) => bail!("atualização não aplicada: {m}"),
+        // Sem `concluido`: a guarda roda `recuperar.bat` assim que este processo sair.
+        Resultado::Critico(m) => bail!("troca inconsistente, recuperação a cargo da guarda: {m}"),
+    }
+
+    // Registro do Windows e impressora: melhor esforço, com o serviço já rodando a nova.
+    let version = crate::VERSION.replace("-", ".");
+    let mut v = crate::VERSION.split('.');
+    let (major, minor, build) = (
+        v.next().unwrap_or("0"),
+        v.next().unwrap_or("0"),
+        v.next().unwrap_or("0"),
+    );
+    let display_icon = get_custom_icon("", &exe).unwrap_or(exe.to_string());
+    let reg_display_icon = if is_msi.unwrap_or(false) {
+        "".to_owned()
+    } else {
+        format!("reg add {subkey} /f /v DisplayIcon /t REG_SZ /d \"{display_icon}\"")
+    };
+    let reg_msi = reg_msi_key
+        .map(|k| format!("reg add {k} /f /v DisplayVersion /t REG_SZ /d \"{version}\""))
+        .unwrap_or_default();
+    let src = src_exe.to_string_lossy();
+    let printer = if is_printer_installed {
+        format!("\"{src}\" --uninstall-remote-printer\n\"{src}\" --install-remote-printer")
+    } else {
+        "".to_owned()
+    };
+    let cmds = format!(
+        "
+chcp 65001
+{reg_display_icon}
+reg add {subkey} /f /v DisplayVersion /t REG_SZ /d \"{version}\"
+reg add {subkey} /f /v Version /t REG_SZ /d \"{version}\"
+reg add {subkey} /f /v BuildDate /t REG_SZ /d \"{build_date}\"
+reg add {subkey} /f /v VersionMajor /t REG_DWORD /d {major}
+reg add {subkey} /f /v VersionMinor /t REG_DWORD /d {minor}
+reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {build}
+reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
+{reg_msi}
+{printer}
+",
+        build_date = crate::BUILD_DATE,
+        size = get_directory_size_kb(&path),
+    );
+    if let Err(e) = run_cmds(cmds, debug, "update") {
+        log::warn!("[portal-update] registro/impressora: {}", e);
+    }
+    log::info!("Update completed.");
     Ok(())
 }
 

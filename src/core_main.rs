@@ -43,6 +43,21 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
 /// If it returns [`Some`], the action determines whether to start the UI or report failure.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<CoreMainAction> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // Relatório da identidade compilada (CI, publicador e troca do Windows). Antes de
+        // qualquer inicialização: só carrega o binário e escreve marca/variante/versão.
+        let a: Vec<String> = std::env::args().take(4).collect();
+        if a.len() == 3 && a[1] == "--suporte-build-info" {
+            match crate::updater::portal::write_build_info(&a[2]) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("suporte-build-info: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
     if !crate::common::global_init() {
         return None;
     }
@@ -244,6 +259,18 @@ pub fn core_main() -> Option<CoreMainAction> {
                 // The elevated updater cannot delete its running verified copy.
                 if let Err(err) = platform::schedule_current_verified_update_file_cleanup() {
                     log::warn!("Failed to schedule verified update file cleanup: {}", err);
+                }
+                // App de suporte: só se instala se for a marca/variante/versão que o app
+                // instalado pediu (o publicador conferiu o digest, isto confere o binário).
+                if crate::updater::portal::build_identity().is_some() {
+                    let esperado = match (args.get(1), args.get(2)) {
+                        (Some(f), Some(e)) if f == "--suporte-esperado" => e.as_str(),
+                        _ => "",
+                    };
+                    if let Err(e) = crate::updater::portal::conferir_esta_build(esperado) {
+                        log::error!("[portal-update] instalação recusada: {e}");
+                        return None;
+                    }
                 }
                 if config::is_disable_installation() {
                     return None;

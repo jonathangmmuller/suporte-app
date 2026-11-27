@@ -16,11 +16,33 @@ permissions:
   contents: write
 
 jobs:
+  # A variante vem da tag (`-cliente` = só entrada). O input tem de concordar, senão nada é
+  # compilado: evita assinar como cliente uma build de gerência (e vice-versa).
+  conferir-variante:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag e somente-entrada coerentes
+        shell: bash
+        env:
+          TAG: ${{ inputs.upload-tag }}
+          SOMENTE_ENTRADA: ${{ inputs.somente-entrada }}
+          DA_TAG: ${{ endsWith(inputs.upload-tag, '-cliente') }}
+        run: |
+          set -euo pipefail
+          if [ "$TAG" != nightly ] && ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(vancin|talkincloud)(-cliente)?$ ]]; then
+            echo "::error::tag fora do formato v<x.y.z>-<marca>[-cliente]: $TAG"; exit 1
+          fi
+          if [ "$SOMENTE_ENTRADA" != "$DA_TAG" ]; then
+            echo "::error::tag '$TAG' pede somente-entrada=$DA_TAG, mas o input veio $SOMENTE_ENTRADA"; exit 1
+          fi
+          echo "tag $TAG: somente-entrada=$DA_TAG"
+
   build:
+    needs: conferir-variante
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
       upload-artifact: true
       upload-tag: ${{ inputs.upload-tag }}
       publish-update-metadata: false
-      somente-entrada: ${{ inputs.somente-entrada }}
+      somente-entrada: ${{ endsWith(inputs.upload-tag, '-cliente') }}
