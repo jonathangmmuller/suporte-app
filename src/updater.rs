@@ -1,6 +1,8 @@
 mod artifact;
 mod download;
 pub(crate) mod portal;
+#[cfg(any(windows, test))]
+pub(crate) mod troca;
 
 use crate::common::do_check_software_update;
 use artifact::verified_update_artifact_from_release_page_url;
@@ -372,9 +374,16 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf, expe
                     ));
                     None
                 };
+                // O binário novo recusa a instalação se não for desta marca/variante e da
+                // versão do manifesto assinado (`--suporte-esperado`).
+                let esperado = portal::build_identity()
+                    .map(|id| {
+                        format!(" --suporte-esperado {}", portal::esperado_para(&id, version))
+                    })
+                    .unwrap_or_default();
                 let update_launched = match crate::platform::launch_privileged_process(
                     session_id,
-                    &format!("\"{}\" --update", update_path),
+                    &format!("\"{}\" --update{}", update_path, esperado),
                 ) {
                     Ok(h) => {
                         if h.is_null() {

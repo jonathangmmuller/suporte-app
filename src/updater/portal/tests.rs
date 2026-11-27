@@ -22,7 +22,7 @@ const SHA: &str = "64e2cf54ff0d244984dd675707fb0057ce16c97acfd7e2b49eec84655f9bd
 
 fn manifest(variant: &str, app_version: &str, file: &str) -> Vec<u8> {
     format!(
-        r#"{{"schema":1,"brand":"vancin","variant":"{variant}","version":"1.5.1","app_version":"{app_version}","release":"v{app_version}-vancin-cliente","files":[{{"os":"windows","arch":"x64","file":"{file}","download_name":"Suporte Vancin.exe","size":26025472,"sha256":"{SHA}"}},{{"os":"macos","arch":"arm64","file":"Suporte-Vancin-1.5.1-aarch64.dmg","size":1000,"sha256":"{SHA}"}}]}}"#
+        r#"{{"schema":1,"brand":"vancin","host":"portal.vancin.com.br","variant":"{variant}","version":"1.5.1","app_version":"{app_version}","release":"v{app_version}-vancin-cliente","files":[{{"os":"windows","arch":"x64","file":"{file}","download_name":"Suporte Vancin.exe","size":26025472,"sha256":"{SHA}"}},{{"os":"macos","arch":"arm64","file":"Suporte-Vancin-1.5.1-aarch64.dmg","size":1000,"sha256":"{SHA}"}}]}}"#
     )
     .into_bytes()
 }
@@ -180,9 +180,17 @@ fn host_diferente_recusado() {
     // campo host assinado, mas de outro domínio
     let m = String::from_utf8(manifest("cliente", "1.0.7", "a.exe"))
         .unwrap()
-        .replace(r#""schema":1,"#, r#""schema":1,"host":"evil.example.com","#)
+        .replace(r#""host":"portal.vancin.com.br""#, r#""host":"evil.example.com""#)
         .into_bytes();
-    assert!(verify(&m, &sign_b64(&m, &k), &id_cliente(), &k).is_err());
+    let e = verify(&m, &sign_b64(&m, &k), &id_cliente(), &k).unwrap_err();
+    assert!(e.to_string().contains("outro host"), "{e}");
+    // sem host: recusado (campo obrigatório)
+    let m = String::from_utf8(manifest("cliente", "1.0.7", "a.exe"))
+        .unwrap()
+        .replace(r#""host":"portal.vancin.com.br","#, "")
+        .into_bytes();
+    let e = verify(&m, &sign_b64(&m, &k), &id_cliente(), &k).unwrap_err();
+    assert!(e.to_string().contains("sem host"), "{e}");
     // nome de arquivo tentando sair do host/pasta
     for f in [
         "https://evil.example.com/a.exe",
@@ -396,4 +404,54 @@ fn manifesto_publicado_pelo_script_aceito() {
     ));
     assert!(verify_manifest_with_keys(man, sig, &id_cliente(), WIN, TRUSTED_KEYS).is_err());
     assert!(verify_manifest_with_keys(man, sig, &id_cliente(), ("linux", "x64"), &keys).is_err());
+}
+
+#[test]
+fn relatorio_de_build_ida_e_volta() {
+    let t = build_info_text(Some(&id_cliente()), true).unwrap();
+    assert_eq!(
+        t,
+        "suporte-build-info v1\nbrand=vancin\nvariant=cliente\nincoming_only=1\nversion=1.0.6\n"
+    );
+    let i = parse_build_info(&t).unwrap();
+    assert_eq!(i.esperado(), "vancin:cliente:1.0.6");
+    assert!(conferir_esperado(&i, &esperado_para(&id_cliente(), "1.0.6")).is_ok());
+    let g = parse_build_info(&build_info_text(Some(&id_gerencia()), false).unwrap()).unwrap();
+    assert_eq!(g.esperado(), "vancin:gerencia:1.0.6");
+    // \r\n (gerado no Windows) também é aceito
+    assert!(parse_build_info(&t.replace('\n', "\r\n")).is_ok());
+}
+
+#[test]
+fn relatorio_de_build_incoerente_recusado() {
+    // variante compilada diz cliente, hbb_common diz gerência (e vice-versa)
+    assert!(build_info_text(Some(&id_cliente()), false).is_err());
+    assert!(build_info_text(Some(&id_gerencia()), true).is_err());
+    assert!(build_info_text(None, true).is_err());
+    let base = "suporte-build-info v1\nbrand=vancin\nvariant=cliente\nincoming_only=1\nversion=1.0.7\n";
+    assert!(parse_build_info(base).is_ok());
+    for ruim in [
+        base.replace("incoming_only=1", "incoming_only=0"),
+        base.replace("variant=cliente", "variant=gerencia"),
+        base.replace("brand=vancin", "brand=outra"),
+        base.replace("version=1.0.7", "version=1.0"),
+        base.replace("suporte-build-info v1", "suporte-build-info v2"),
+        base.replace("version=1.0.7\n", ""),
+        format!("{base}brand=vancin\n"),
+        String::new(),
+    ] {
+        assert!(parse_build_info(&ruim).is_err(), "{ruim:?}");
+    }
+}
+
+#[test]
+fn instalador_de_outra_variante_recusado() {
+    let gerencia = parse_build_info(&build_info_text(Some(&id_gerencia()), false).unwrap()).unwrap();
+    // app cliente instalado espera cliente 1.0.6; recebe gerência 1.0.6 (mesmo digest assinado)
+    let e = conferir_esperado(&gerencia, &esperado_para(&id_cliente(), "1.0.6")).unwrap_err();
+    assert!(e.to_string().contains("outra build"), "{e}");
+    let cliente = parse_build_info(&build_info_text(Some(&id_cliente()), true).unwrap()).unwrap();
+    assert!(conferir_esperado(&cliente, "vancin:cliente:1.0.7").is_err()); // versão
+    assert!(conferir_esperado(&cliente, "talkincloud:cliente:1.0.6").is_err()); // marca
+    assert!(conferir_esperado(&cliente, "").is_err());
 }

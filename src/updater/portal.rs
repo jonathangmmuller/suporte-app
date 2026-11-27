@@ -14,7 +14,7 @@
 //!
 //! Regras de aceitação (todas obrigatórias):
 //!   1. assinatura Ed25519 válida de `CONTEXTO || manifest.json` com uma chave embutida;
-//!   2. `schema == 1`, `brand` e `variant` iguais aos da compilação (`host`, se houver, igual);
+//!   2. `schema == 1`; `brand`, `variant` e `host` presentes e iguais aos da compilação;
 //!   3. `app_version` estritamente maior que a do app (sem downgrade, sem reinstalar a mesma);
 //!   4. arquivo do sistema/arquitetura com nome simples, sha256 hex de 64 e tamanho plausível;
 //!   5. a URL de download é montada aqui (mesmo host e pasta), nunca lida do manifesto;
@@ -141,6 +141,121 @@ pub(crate) fn build_identity() -> Option<BuildIdentity> {
     })
 }
 
+/// Cabeçalho do relatório `--suporte-build-info` (lido pelo CI, pelo publicador e pela troca
+/// do Windows para conferir que o binário é da marca/variante/versão esperadas).
+pub(crate) const BUILD_INFO_HEADER: &str = "suporte-build-info v1";
+
+/// Relatório da identidade compilada. `incoming_only` vem do `hbb_common` (o que de fato
+/// decide se a build só recebe acesso); tem de bater com a variante.
+pub(crate) fn build_info_text(id: Option<&BuildIdentity>, incoming_only: bool) -> ResultType<String> {
+    let id = id.ok_or_else(|| anyhow!("build sem identidade (SUPORTE_APP_NAME/SUPORTE_VERSAO)"))?;
+    if (id.variant == "cliente") != incoming_only {
+        bail!(
+            "variante {} incoerente com incoming_only={}",
+            id.variant,
+            incoming_only
+        );
+    }
+    Ok(format!(
+        "{BUILD_INFO_HEADER}\nbrand={}\nvariant={}\nincoming_only={}\nversion={}\n",
+        id.brand,
+        id.variant,
+        if incoming_only { 1 } else { 0 },
+        version_string(id.version)
+    ))
+}
+
+/// `--suporte-build-info <arquivo>`: grava o relatório desta build.
+pub(crate) fn write_build_info(path: &str) -> ResultType<()> {
+    let t = build_info_text(
+        build_identity().as_ref(),
+        hbb_common::config::is_incoming_only(),
+    )?;
+    std::fs::write(path, t)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BuildInfo {
+    pub brand: String,
+    pub variant: String,
+    pub incoming_only: bool,
+    pub version: (u32, u32, u32),
+}
+
+impl BuildInfo {
+    /// `marca:variante:versão`, formato do `--suporte-esperado`.
+    pub fn esperado(&self) -> String {
+        format!("{}:{}:{}", self.brand, self.variant, version_string(self.version))
+    }
+}
+
+pub(crate) fn parse_build_info(t: &str) -> ResultType<BuildInfo> {
+    let mut linhas = t.lines();
+    if linhas.next().map(str::trim) != Some(BUILD_INFO_HEADER) {
+        bail!("relatório de build sem cabeçalho");
+    }
+    let mut campos = std::collections::BTreeMap::new();
+    for l in linhas.map(str::trim).filter(|l| !l.is_empty()) {
+        let (k, v) = l.split_once('=').ok_or_else(|| anyhow!("linha inválida: {l}"))?;
+        if campos.insert(k, v).is_some() {
+            bail!("campo repetido: {k}");
+        }
+    }
+    let campo = |k: &str| campos.get(k).copied().ok_or_else(|| anyhow!("sem {k}"));
+    let brand = campo("brand")?;
+    if !matches!(brand, "vancin" | "talkincloud") {
+        bail!("marca desconhecida: {brand}");
+    }
+    let variant = campo("variant")?;
+    let incoming_only = match campo("incoming_only")? {
+        "1" => true,
+        "0" => false,
+        v => bail!("incoming_only inválido: {v}"),
+    };
+    match (variant, incoming_only) {
+        ("cliente", true) | ("gerencia", false) => {}
+        _ => bail!("variante {variant} incoerente com incoming_only={incoming_only}"),
+    }
+    let v = campo("version")?;
+    let version = parse_version(v).ok_or_else(|| anyhow!("versão inválida: {v}"))?;
+    Ok(BuildInfo {
+        brand: brand.to_owned(),
+        variant: variant.to_owned(),
+        incoming_only,
+        version,
+    })
+}
+
+/// O que o app instalado espera do instalador que vai rodar: mesma marca e variante, versão
+/// do manifesto assinado.
+pub(crate) fn esperado_para(id: &BuildIdentity, app_version: &str) -> String {
+    format!("{}:{}:{}", id.brand, id.variant, app_version)
+}
+
+/// Recusa um binário cujo relatório não é o esperado (`marca:variante:versão`).
+pub(crate) fn conferir_esperado(info: &BuildInfo, esperado: &str) -> ResultType<()> {
+    let e = esperado.trim();
+    if e.is_empty() || info.esperado() != e {
+        bail!(
+            "instalador de outra build: é {}, esperado {}",
+            info.esperado(),
+            e
+        );
+    }
+    Ok(())
+}
+
+/// A própria build confere o `--suporte-esperado` recebido (no `--update`, antes de tocar
+/// em qualquer coisa).
+pub(crate) fn conferir_esta_build(esperado: &str) -> ResultType<()> {
+    let t = build_info_text(
+        build_identity().as_ref(),
+        hbb_common::config::is_incoming_only(),
+    )?;
+    conferir_esperado(&parse_build_info(&t)?, esperado)
+}
+
 /// (os, arch) como aparecem no manifesto, para este binário.
 pub(crate) fn current_target() -> Option<(&'static str, &'static str)> {
     target_for(std::env::consts::OS, std::env::consts::ARCH)
@@ -255,10 +370,10 @@ pub(crate) fn verify_manifest_with_keys(
     if m.variant.as_deref() != Some(id.variant) {
         bail!("manifesto de outra variante: {:?}", m.variant);
     }
-    if let Some(h) = &m.host {
-        if h != id.host {
-            bail!("manifesto de outro host: {}", h);
-        }
+    match m.host.as_deref() {
+        None => bail!("manifesto sem host"),
+        Some(h) if h != id.host => bail!("manifesto de outro host: {}", h),
+        Some(_) => {}
     }
     let app_version = m
         .app_version

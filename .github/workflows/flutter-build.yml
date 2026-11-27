@@ -587,6 +587,18 @@ jobs:
         run: |
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
 
+      - name: Metadado da build (marca, variante, versão + sha256)
+        if: env.UPLOAD_ARTIFACT == 'true' && startsWith(env.TAG_NAME, 'v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/suporte-build-info.txt"
+          rm -f "$R"
+          # carrega EXE + DLL compilados e escreve a identidade (sai sem abrir janela)
+          timeout 120 ./rustdesk/rustdesk.exe --suporte-build-info "$R"
+          python3 res/suporte_build_info.py --tag "$TAG_NAME" --relatorio "$R" \
+            ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.exe ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.msi
+
       - name: Upload signed Windows Flutter EXE
         if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -612,6 +624,7 @@ jobs:
           files: |
             ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.msi
             ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.exe
+            ./SignOutput/${{ env.SUPORTE_FILE_PREFIX }}-*.build-info.json
 
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
   build-for-windows-sciter:
@@ -2210,6 +2223,14 @@ jobs:
                 mv "$name" /workspace/"${name%%.rpm}-suse.rpm"
             done
 
+      - name: Metadado da build (deb)
+        if: env.UPLOAD_ARTIFACT == 'true' && startsWith(env.TAG_NAME, 'v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # binário do container não roda aqui: confere tag × ambiente da compilação
+          python3 res/suporte_build_info.py --tag "$TAG_NAME" --sem-binario rustdesk-*.deb
+
       - name: Publish debian/rpm package
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -2219,6 +2240,7 @@ jobs:
           files: |
             rustdesk-*.deb
             rustdesk-*.rpm
+            rustdesk-*.deb.build-info.json
 
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
