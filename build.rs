@@ -90,7 +90,32 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
+/// Versão do app de suporte (usada pelo atualizador do portal). Vem de `SUPORTE_VERSAO`
+/// ou, se ausente, da tag do release (`TAG_NAME`, ex.: v1.0.6-vancin-cliente → 1.0.6).
+/// Sem versão válida o atualizador fica desligado no binário (ex.: build "nightly").
+fn suporte_versao() {
+    println!("cargo:rerun-if-env-changed=SUPORTE_VERSAO");
+    println!("cargo:rerun-if-env-changed=TAG_NAME");
+    if std::env::var("SUPORTE_VERSAO").map_or(false, |v| !v.trim().is_empty()) {
+        return; // option_env!("SUPORTE_VERSAO") já enxerga o valor do ambiente
+    }
+    let Ok(tag) = std::env::var("TAG_NAME") else {
+        return;
+    };
+    let v = tag.strip_prefix('v').unwrap_or(&tag);
+    let v = v.split('-').next().unwrap_or("");
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        println!("cargo:rustc-env=SUPORTE_VERSAO={v}");
+    }
+}
+
 fn main() {
+    suporte_versao();
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
