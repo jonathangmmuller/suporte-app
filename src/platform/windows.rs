@@ -3730,10 +3730,15 @@ taskkill /F /IM {app_name}.exe{filter}
 
 /// Atualização do app de suporte: monta e confere a nova instalação ao lado da atual, só
 /// então para o serviço e troca as pastas; se a nova não subir, volta a anterior. Uma guarda
-/// fora deste processo e uma tarefa "ao iniciar" recuperam se a troca for interrompida.
-/// ID, senha permanente e configuração ficam no perfil do serviço e não são tocados.
+/// fora deste processo e duas tarefas SYSTEM ("ao iniciar" e "a cada minuto") recuperam se a
+/// troca for interrompida, até o serviço ficar RUNNING. Só atualiza com a instalação, a
+/// pasta-mãe e os ancestrais protegidos (`troca::acl`). ID, senha permanente e configuração
+/// ficam no perfil do serviço e não são tocados.
 fn update_me_suporte(debug: bool) -> ResultType<()> {
-    use crate::updater::troca::{self, Caminhos, Preparo, Resultado, SistemaWindows, Tempos};
+    use crate::updater::troca::{
+        self, acl, Caminhos, Momento, Preparo, Resultado, SistemaWindows, Tempos,
+    };
+    use std::os::windows::fs::OpenOptionsExt;
     const NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED: u32 = 0x0000_0008;
     const NEW_GROUP: u32 = 0x0000_0200;
@@ -3748,7 +3753,21 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     let is_msi = is_msi_installed().ok();
     let reg_msi_key = get_reg_msi_key(&subkey, is_msi)?;
     let app_exe_name = format!("{}.exe", &app_name);
-    let c = Caminhos::de(Path::new(&path));
+    // Scripts SYSTEM, trava e marcador fora da pasta de programas, em pasta protegida.
+    let base = PathBuf::from(
+        std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into()),
+    )
+    .join(&app_name);
+    let c = Caminhos::de(Path::new(&path), &base.join("atualizacao"));
+    let cadeia = |p: &Path, estritos: usize| -> ResultType<()> {
+        acl::conferir_cadeia(p, estritos, &mut acl::ler_descritor).map_err(|e| {
+            log::error!("[portal-update] pasta não protegida, não atualizo: {e}");
+            anyhow!("pasta não protegida: {e}")
+        })
+    };
+    // Instalação e pasta-mãe: só SYSTEM/Administradores/TrustedInstaller gravam; ancestrais:
+    // ninguém mais apaga, renomeia nem troca permissões; sem reparse points.
+    cadeia(&c.atual, 2)?;
     let origem = src_exe
         .parent()
         .ok_or(anyhow!("Can't get parent directory of {:?}", src_exe))?
@@ -3768,16 +3787,39 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     )?)?
     .esperado();
     let tarefa = format!("{app_name}-recuperar-atualizacao");
+    let tarefa_minuto = format!("{tarefa}-minuto");
+    let tarefas = [tarefa.as_str(), tarefa_minuto.as_str()];
     let schtasks = |args: &[&str]| {
         std::process::Command::new("schtasks")
             .args(args)
             .creation_flags(NO_WINDOW)
             .output()
     };
+    let apagar_tarefas = || {
+        for t in tarefas {
+            let _ = schtasks(&["/Delete", "/F", "/TN", t]);
+        }
+    };
 
-    // Restos de uma atualização anterior (já concluída: o serviço roda da instalação atual).
-    let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
+    // Restos de uma atualização anterior já concluída. Com recuperação pendente (`troca` sem
+    // `concluido`), `limpar_restos` recusa e as tarefas continuam.
     c.limpar_restos()?;
+    apagar_tarefas();
+    if std::fs::symlink_metadata(&base).is_err() {
+        acl::criar_pasta_protegida(&base).map_err(|e| anyhow!("criar {:?}: {e}", base))?;
+    }
+    cadeia(&base, 0)?;
+    // Nasce com DACL protegida; falha se alguém a criou entre a limpeza e aqui.
+    acl::criar_pasta_protegida(&c.troca).map_err(|e| anyhow!("criar {:?}: {e}", c.troca))?;
+    cadeia(&c.troca, 1)?;
+    // Trava da recuperação: segurada até o fim; `recuperar.bat` (guarda/tarefas) sai com 3
+    // sem tocar em nada enquanto este processo vive.
+    let _trava = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(c.troca.join(troca::TRAVA))
+        .map_err(|e| anyhow!("trava da recuperação: {e}"))?;
 
     // Janela e bandeja (como no upstream); voltam no fim, qualquer que seja o resultado.
     let main_window_pids =
@@ -3811,33 +3853,76 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         exe_destino: &app_exe_name,
         extras: &extras,
         remover: &remover,
+        criar_novo: acl::criar_pasta_protegida,
     };
     let relatorio = std::env::temp_dir().join(format!("{app_name}-build-info-{}.txt", std::process::id()));
     let mut validar = |novo_exe: &Path| {
         troca::validar_exe(novo_exe, &relatorio, &esperado, Duration::from_secs(60))
     };
+    let recuperar = c.troca.join(troca::SCRIPT_RECUPERAR);
+    let guarda = c.troca.join("guarda.bat");
+    let texto_recuperar = troca::script_recuperar(
+        &c,
+        &app_name,
+        win_topmost_window::INJECTED_PROCESS_EXE,
+        &tarefas,
+        &Tempos::PADRAO,
+    )?;
+    let texto_guarda = troca::script_guarda(&c, std::process::id(), 240)?;
+    let hash = |t: &str| -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(t.as_bytes()).into()
+    };
+    let (hash_recuperar, hash_guarda) = (hash(&texto_recuperar), hash(&texto_guarda));
+    // Scripts que rodam como SYSTEM: o que está no disco é o que geramos, em pasta protegida.
+    let conferir_scripts = || -> ResultType<()> {
+        for (p, h) in [(&recuperar, &hash_recuperar), (&guarda, &hash_guarda)] {
+            cadeia(p, 2)?;
+            if troca::sha256_arquivo(p)? != *h {
+                bail!("{:?} diferente do gerado", p);
+            }
+        }
+        Ok(())
+    };
+    let mut conferir = |m: Momento| -> ResultType<()> {
+        cadeia(&c.atual, 2)?;
+        cadeia(&c.novo, 2)?;
+        cadeia(&c.troca, 1)?;
+        if m == Momento::AntesDeTrocar {
+            conferir_scripts()?;
+        }
+        Ok(())
+    };
     let mut kill_ui = Some((main_window_pids, tray_pids));
     let mut antes_de_parar = || -> ResultType<()> {
-        std::fs::create_dir_all(&c.troca)?;
-        let recuperar = c.troca.join("recuperar.bat");
-        let guarda = c.troca.join("guarda.bat");
-        std::fs::write(
-            &recuperar,
-            troca::script_recuperar(&c, &app_name, win_topmost_window::INJECTED_PROCESS_EXE, &tarefa)?,
-        )?;
-        std::fs::write(&guarda, troca::script_guarda(&c, std::process::id(), 240)?)?;
+        for (p, t) in [(&recuperar, &texto_recuperar), (&guarda, &texto_guarda)] {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p)?;
+            f.write_all(t.as_bytes())?;
+            f.sync_all()?;
+        }
+        conferir_scripts()?;
         let recuperar_s = recuperar.to_str().ok_or(anyhow!("caminho inválido"))?;
         let guarda_s = guarda.to_str().ok_or(anyhow!("caminho inválido"))?;
-        // Reinício no meio da troca: roda a recuperação ao iniciar, como SYSTEM.
-        let out = schtasks(&[
-            "/Create", "/F", "/RU", "SYSTEM", "/RL", "HIGHEST", "/SC", "ONSTART", "/TN", &tarefa,
-            "/TR", &format!("\"{recuperar_s}\""),
-        ])?;
-        if !out.status.success() {
-            bail!(
-                "tarefa de recuperação não criada: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        // Reinício no meio da troca e recuperação pendente: as duas rodam o mesmo script como
+        // SYSTEM (serializadas pela trava) até o serviço ficar RUNNING.
+        let tr = format!("\"{recuperar_s}\"");
+        for (tn, quando) in [
+            (tarefa.as_str(), &["/SC", "ONSTART"][..]),
+            (tarefa_minuto.as_str(), &["/SC", "MINUTE", "/MO", "1"][..]),
+        ] {
+            let mut args = vec!["/Create", "/F", "/RU", "SYSTEM", "/RL", "HIGHEST"];
+            args.extend_from_slice(quando);
+            args.extend_from_slice(&["/TN", tn, "/TR", tr.as_str()]);
+            let out = schtasks(&args);
+            if !matches!(out, Ok(ref o) if o.status.success()) {
+                apagar_tarefas();
+                bail!(
+                    "tarefa de recuperação {tn} não criada: {}",
+                    out.map(|o| String::from_utf8_lossy(&o.stderr).trim().to_owned())
+                        .unwrap_or_else(|e| e.to_string())
+                );
+            }
         }
         // Guarda fora deste processo (sobrevive a ele; só age depois que ele sair).
         let mut cmd = std::process::Command::new("cmd");
@@ -3852,7 +3937,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
                     .spawn()
             });
         if let Err(e) = filho {
-            let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
+            apagar_tarefas();
             bail!("guarda não iniciada: {e}");
         }
         // Só agora (tudo pronto) fecha janela e bandeja da versão atual.
@@ -3868,6 +3953,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
             app_exe_name.clone(),
             win_topmost_window::INJECTED_PROCESS_EXE.to_owned(),
         ],
+        tarefas: tarefas.iter().map(|t| t.to_string()).collect(),
     };
 
     let _restore_session_guard = {
@@ -3903,6 +3989,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         &c,
         &preparo,
         &mut troca::copiar_arquivo,
+        &mut conferir,
         &mut validar,
         &mut antes_de_parar,
         &mut sistema,
@@ -3911,11 +3998,15 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     );
     let _ = std::fs::remove_file(&relatorio);
     log::info!("[portal-update] resultado da troca: {:?}", r);
+    // Consistente = nada a recuperar e, se o serviço rodava antes, RUNNING confirmado.
+    // As tarefas só saem com `concluido` gravado e conferido.
     if r.consistente() {
-        if c.troca.is_dir() {
-            allow_err!(std::fs::write(c.concluido(), "ok"));
+        match std::fs::write(c.concluido(), "ok").and_then(|_| std::fs::read(c.concluido())) {
+            Ok(b) if b == b"ok" => apagar_tarefas(),
+            Ok(_) | Err(_) => {
+                log::error!("[portal-update] não gravei {:?}; tarefas mantidas", c.concluido())
+            }
         }
-        let _ = schtasks(&["/Delete", "/F", "/TN", &tarefa]);
     }
     match r {
         Resultado::Atualizado => {}

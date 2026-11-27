@@ -39,6 +39,13 @@ jobs:
 
   build:
     needs: conferir-variante
+    # atestação de procedência (Sigstore): só este job recebe OIDC; o job chamado
+    # não pode ter mais permissão do que o chamador concede aqui
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
