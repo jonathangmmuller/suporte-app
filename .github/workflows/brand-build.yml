@@ -15,6 +15,11 @@ on:
         description: "Bancada: só Windows + testes Rust + pausas por fase; gera só artefato do Actions (nenhuma release/tag)"
         type: boolean
         default: false
+      versao-bancada:
+        description: "Bancada: versão x.y.z gravada no binário (obrigatória com bancada; maior que a última publicada)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,11 +37,34 @@ jobs:
           SOMENTE_ENTRADA: ${{ inputs.somente-entrada }}
           DA_TAG: ${{ endsWith(inputs.upload-tag, '-cliente') }}
           BANCADA: ${{ inputs.bancada }}
+          VERSAO_BANCADA: ${{ inputs.versao-bancada }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # Bancada não publica: só a tag nightly, que nem chega a ser tocada (UPLOAD_ARTIFACT=false).
           if [ "$BANCADA" = true ] && [ "$TAG" != nightly ]; then
             echo "::error::bancada só com upload-tag=nightly (nada é publicado): $TAG"; exit 1
+          fi
+          # Bancada: versão explícita, senão o binário sai sem identidade e usa o atualizador
+          # antigo. Maior que a última publicada (qualquer marca/variante), para exercitar a troca.
+          if [ "$BANCADA" = true ]; then
+            if ! [[ "$VERSAO_BANCADA" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+              echo "::error::bancada exige versao-bancada x.y.z: '$VERSAO_BANCADA'"; exit 1
+            fi
+            ULTIMA=$(gh api "repos/$REPO/releases" --paginate --jq '.[].tag_name' \
+              | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)-(vancin|talkincloud)(-cliente)?$/\1/p' \
+              | sort -V | tail -n 1)
+            if [ -z "$ULTIMA" ]; then
+              echo "::error::nenhuma release v<x.y.z>-<marca> encontrada para comparar"; exit 1
+            fi
+            if [ "$VERSAO_BANCADA" = "$ULTIMA" ] \
+              || [ "$(printf '%s\n%s\n' "$ULTIMA" "$VERSAO_BANCADA" | sort -V | tail -n 1)" != "$VERSAO_BANCADA" ]; then
+              echo "::error::versao-bancada $VERSAO_BANCADA não é maior que a última publicada ($ULTIMA)"; exit 1
+            fi
+            echo "bancada: versão $VERSAO_BANCADA (última publicada: $ULTIMA)"
+          elif [ -n "$VERSAO_BANCADA" ]; then
+            echo "::error::versao-bancada só vale com bancada=true"; exit 1
           fi
           if [ "$TAG" != nightly ] && ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(vancin|talkincloud)(-cliente)?$ ]]; then
             echo "::error::tag fora do formato v<x.y.z>-<marca>[-cliente]: $TAG"; exit 1
@@ -63,3 +91,4 @@ jobs:
       publish-update-metadata: false
       somente-entrada: ${{ endsWith(inputs.upload-tag, '-cliente') }}
       bancada: ${{ inputs.bancada }}
+      versao-bancada: ${{ inputs.versao-bancada }}

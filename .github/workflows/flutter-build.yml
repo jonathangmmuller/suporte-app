@@ -18,6 +18,9 @@ on:
       bancada:
         type: boolean
         default: false
+      versao-bancada:
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       upload-artifact:
@@ -40,6 +43,10 @@ on:
         description: "Bancada: só Windows, testes Rust, pausas por fase; nada publicado (só artefato do Actions)"
         type: boolean
         default: false
+      versao-bancada:
+        description: "Bancada: versão x.y.z gravada no binário (obrigatória com bancada)"
+        type: string
+        default: ""
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -372,6 +379,35 @@ jobs:
         shell: bash
         run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
 
+      - name: Bancada - versão explícita do binário
+        # Sem SUPORTE_VERSAO, o build `nightly` sai sem identidade e usa o atualizador antigo.
+        # O build.rs também recusa (feature bancada-pausas); aqui falha antes de compilar.
+        # Maior que a última release desta marca (vale também num dispatch direto deste workflow).
+        if: ${{ inputs.bancada }}
+        shell: bash
+        env:
+          VERSAO_BANCADA: ${{ inputs.versao-bancada }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSAO_BANCADA" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] \
+            || { echo "::error::bancada exige versao-bancada x.y.z: '$VERSAO_BANCADA'"; exit 1; }
+          case "$SUPORTE_APP_NAME" in
+            SuporteVancin) MARCA=vancin ;;
+            SuporteTalkInCloud) MARCA=talkincloud ;;
+            *) echo "::error::marca desconhecida: $SUPORTE_APP_NAME"; exit 1 ;;
+          esac
+          ULTIMA=$(gh api "repos/$REPO/releases" --paginate --jq '.[].tag_name' \
+            | sed -nE "s/^v([0-9]+\.[0-9]+\.[0-9]+)-$MARCA(-cliente)?\$/\1/p" | sort -V | tail -n 1)
+          [ -n "$ULTIMA" ] || { echo "::error::nenhuma release de $MARCA para comparar"; exit 1; }
+          if [ "$VERSAO_BANCADA" = "$ULTIMA" ] \
+            || [ "$(printf '%s\n%s\n' "$ULTIMA" "$VERSAO_BANCADA" | sort -V | tail -n 1)" != "$VERSAO_BANCADA" ]; then
+            echo "::error::versao-bancada $VERSAO_BANCADA não é maior que a última de $MARCA ($ULTIMA)"; exit 1
+          fi
+          echo "SUPORTE_VERSAO=$VERSAO_BANCADA" >> "$GITHUB_ENV"
+          echo "bancada: $MARCA $VERSAO_BANCADA (última publicada: $ULTIMA)"
+
       - name: Build rustdesk
         run: |
           # Windows: build RustDesk
@@ -412,6 +448,31 @@ jobs:
           } catch {
               Write-Host "Ingore the printer driver error."
           }
+
+      - name: Bancada - identidade do artefato (--suporte-build-info)
+        # O EXE + DLL compilados (a pasta que vira NOVA) informam marca, variante e versão; tem de
+        # ser exatamente a pedida. Prova que a troca usa o atualizador novo (build_identity()).
+        if: ${{ inputs.bancada }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$SUPORTE_APP_NAME" in
+            SuporteVancin) MARCA=vancin ;;
+            SuporteTalkInCloud) MARCA=talkincloud ;;
+            *) echo "::error::marca desconhecida: $SUPORTE_APP_NAME"; exit 1 ;;
+          esac
+          if [ "$SUPORTE_SOMENTE_ENTRADA" = 1 ]; then VAR=cliente; IO=1; else VAR=gerencia; IO=0; fi
+          test -n "${SUPORTE_VERSAO:-}" || { echo "::error::SUPORTE_VERSAO ausente"; exit 1; }
+          R="$RUNNER_TEMP/bancada-build-info.txt"
+          E="$RUNNER_TEMP/bancada-build-info-esperado.txt"
+          rm -f "$R"
+          timeout 120 ./rustdesk/rustdesk.exe --suporte-build-info "$R" \
+            || { echo "::error::--suporte-build-info falhou (binário sem identidade?)"; exit 1; }
+          printf 'suporte-build-info v1\nbrand=%s\nvariant=%s\nincoming_only=%s\nversion=%s\n' \
+            "$MARCA" "$VAR" "$IO" "$SUPORTE_VERSAO" > "$E"
+          tr -d '\r' < "$R" > "$R.lf"
+          diff -u "$E" "$R.lf" || { echo "::error::identidade do artefato diferente da pedida"; exit 1; }
+          echo "artefato: $MARCA:$VAR:$SUPORTE_VERSAO"
 
       - name: Run the Rust tests
         # x86_64 only: the tests are the same code on arm64, and that runner is the slow one.
