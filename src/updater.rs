@@ -3,6 +3,9 @@ mod download;
 pub(crate) mod portal;
 #[cfg(any(windows, test))]
 pub(crate) mod troca;
+// Regra de versão do build.rs (incluída lá com #[path]); aqui, só para os testes.
+#[cfg(test)]
+mod versao_build;
 
 use crate::common::do_check_software_update;
 use artifact::verified_update_artifact_from_release_page_url;
