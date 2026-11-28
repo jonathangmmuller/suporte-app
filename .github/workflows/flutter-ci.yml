@@ -19,6 +19,14 @@ on:
 
 jobs:
   run-ci:
+    # O job chamado pede estas permissões (Windows flutter: contents/id-token/attestations/
+    # artifact-metadata); sem concedê-las aqui o run morre em startup_failure. Com
+    # upload-artifact: false nenhum passo de release/atestação roda.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: false

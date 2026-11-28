@@ -11,6 +11,10 @@ on:
         description: "Build de cliente (só recebe acesso, sem conectar em outras máquinas)"
         type: boolean
         default: false
+      bancada:
+        description: "Bancada: só Windows + testes Rust + pausas por fase; gera só artefato do Actions (nenhuma release/tag)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,8 +31,13 @@ jobs:
           TAG: ${{ inputs.upload-tag }}
           SOMENTE_ENTRADA: ${{ inputs.somente-entrada }}
           DA_TAG: ${{ endsWith(inputs.upload-tag, '-cliente') }}
+          BANCADA: ${{ inputs.bancada }}
         run: |
           set -euo pipefail
+          # Bancada não publica: só a tag nightly, que nem chega a ser tocada (UPLOAD_ARTIFACT=false).
+          if [ "$BANCADA" = true ] && [ "$TAG" != nightly ]; then
+            echo "::error::bancada só com upload-tag=nightly (nada é publicado): $TAG"; exit 1
+          fi
           if [ "$TAG" != nightly ] && ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(vancin|talkincloud)(-cliente)?$ ]]; then
             echo "::error::tag fora do formato v<x.y.z>-<marca>[-cliente]: $TAG"; exit 1
           fi
@@ -49,7 +58,8 @@ jobs:
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
-      upload-artifact: true
+      upload-artifact: ${{ !inputs.bancada }}
       upload-tag: ${{ inputs.upload-tag }}
       publish-update-metadata: false
       somente-entrada: ${{ endsWith(inputs.upload-tag, '-cliente') }}
+      bancada: ${{ inputs.bancada }}
