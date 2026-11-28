@@ -90,27 +90,40 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
-/// Versão do app de suporte (usada pelo atualizador do portal). Vem de `SUPORTE_VERSAO`
-/// ou, se ausente, da tag do release (`TAG_NAME`, ex.: v1.0.6-vancin-cliente → 1.0.6).
-/// Sem versão válida o atualizador fica desligado no binário (ex.: build "nightly").
+#[path = "src/updater/versao_build.rs"]
+#[allow(dead_code)]
+mod versao_build;
+
+/// Versão do app de suporte (usada pelo atualizador do portal). Regra em
+/// `src/updater/versao_build.rs` (testada na lib):
+/// - build normal: `SUPORTE_VERSAO` ou, se ausente, a tag do release (`TAG_NAME`, ex.:
+///   v1.0.6-vancin-cliente → 1.0.6). Sem versão válida (ex.: "nightly"), o atualizador fica
+///   desligado no binário;
+/// - build de bancada (feature `bancada-pausas`): marca e `SUPORTE_VERSAO` explícitas e
+///   válidas, senão o build **falha** (com `nightly`, sem identidade, cairia no atualizador
+///   antigo).
 fn suporte_versao() {
-    println!("cargo:rerun-if-env-changed=SUPORTE_VERSAO");
-    println!("cargo:rerun-if-env-changed=TAG_NAME");
-    if std::env::var("SUPORTE_VERSAO").map_or(false, |v| !v.trim().is_empty()) {
-        return; // option_env!("SUPORTE_VERSAO") já enxerga o valor do ambiente
+    println!("cargo:rerun-if-changed=src/updater/versao_build.rs");
+    for v in ["SUPORTE_VERSAO", "TAG_NAME", "SUPORTE_APP_NAME", "SUPORTE_SOMENTE_ENTRADA"] {
+        println!("cargo:rerun-if-env-changed={v}");
     }
-    let Ok(tag) = std::env::var("TAG_NAME") else {
-        return;
-    };
-    let v = tag.strip_prefix('v').unwrap_or(&tag);
-    let v = v.split('-').next().unwrap_or("");
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        println!("cargo:rustc-env=SUPORTE_VERSAO={v}");
+    let var = |n: &str| std::env::var(n).ok();
+    let bancada = std::env::var_os("CARGO_FEATURE_BANCADA_PAUSAS").is_some();
+    match versao_build::resolver(
+        var("SUPORTE_APP_NAME").as_deref(),
+        var("SUPORTE_VERSAO").as_deref(),
+        var("TAG_NAME").as_deref(),
+        var("SUPORTE_SOMENTE_ENTRADA").as_deref(),
+        bancada,
+    ) {
+        // option_env!("SUPORTE_VERSAO") já enxerga o valor do ambiente
+        Ok(versao_build::Versao::DoAmbiente) | Ok(versao_build::Versao::Nenhuma) => {}
+        Ok(versao_build::Versao::DaTag(v)) => println!("cargo:rustc-env=SUPORTE_VERSAO={v}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            println!("cargo:warning={e}");
+            std::process::exit(1);
+        }
     }
 }
 
