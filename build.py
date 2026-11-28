@@ -146,6 +146,12 @@ def make_parser():
              'dlopen-ed in-process by the root service). Off by default.'
     )
     parser.add_argument(
+        '--bancada-pausas',
+        action='store_true',
+        help='Windows bench build only: compile the updater pause points (feature bancada-pausas). '
+             'Never for a published build.'
+    )
+    parser.add_argument(
         '--print-features',
         action='store_true',
         help='Print the cargo feature list these flags select, and exit without building. For a '
@@ -349,6 +355,10 @@ def get_features(args):
     if osx:
         if args.screencapturekit:
             features.append('screencapturekit')
+    if args.bancada_pausas:
+        if not windows:
+            raise Exception('--bancada-pausas is Windows only')
+        features.append('bancada-pausas')
     print("features:", features)
     return features
 

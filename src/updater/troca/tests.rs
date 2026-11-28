@@ -20,6 +20,7 @@ const T0: Tempos = Tempos {
     // espera do manual (em passos) maior que a execução mais longa do corpo, como os 20 min de
     // `Tempos::PADRAO` diante do pior caso de ≈ 8 min
     trava: 200,
+    habilitar: 3,
 };
 
 fn tmp() -> PathBuf {
@@ -141,8 +142,12 @@ struct Falso {
     falhas_renomear: HashMap<PathBuf, u32>,
     /// Tarefas fixas da recuperação registradas (ao iniciar e a cada minuto).
     tarefas: bool,
-    /// As fixas habilitadas (o modo manual desabilita).
-    habilitadas: bool,
+    /// As fixas habilitadas, [ao iniciar, de minuto] (o modo manual desabilita).
+    habilitadas: [bool; 2],
+    /// Por fixa: quantas `/ENABLE` ainda não pegam (`u32::MAX` = nunca pegam).
+    falhas_habilitar: [u32; 2],
+    /// Por fixa: `/ENABLE` "dá certo" mas a tarefa continua desabilitada (só a consulta vê).
+    habilitar_mente: [bool; 2],
     /// Tarefa `religar` registrada.
     religar: bool,
     /// Processos segurando `recuperar.lock` agora (e o máximo visto).
@@ -152,7 +157,8 @@ struct Falso {
     trava_quebrada: bool,
     /// `rd /s /q` de `.falhou` falha (arquivo preso) e a pasta fica.
     falhou_presa: bool,
-    /// Operações de agenda que falham: "criar_religar", "desabilitar", "habilitar".
+    /// Operações de agenda que falham: "criar_religar", "desabilitar" e "desabilitar_2" (a
+    /// primeira fixa desabilita, a segunda não).
     falhar_agenda: Vec<&'static str>,
     /// Operações até a "queda de energia" (pânico); `None` = sem queda.
     vida: Option<u32>,
@@ -173,7 +179,9 @@ impl Falso {
             quebrado: false,
             falhas_renomear: HashMap::new(),
             tarefas: true,
-            habilitadas: true,
+            habilitadas: [true; 2],
+            falhas_habilitar: [0; 2],
+            habilitar_mente: [false; 2],
             religar: false,
             donos: 0,
             max_donos: 0,
@@ -189,6 +197,10 @@ impl Falso {
     }
     fn eventos(&self) -> Vec<String> {
         self.eventos.borrow().clone()
+    }
+    /// As duas fixas habilitadas.
+    fn hab(&self) -> bool {
+        self.habilitadas == [true; 2]
     }
     fn operacao(&mut self) {
         if let Some(v) = self.vida.as_mut() {
@@ -336,18 +348,35 @@ impl Sistema for Falso {
         if self.falhar_agenda.contains(&"desabilitar") && self.tarefas {
             return false;
         }
-        self.ev("desabilitar");
-        self.habilitadas = false;
-        true
-    }
-    fn habilitar_tarefas(&mut self) -> bool {
-        self.operacao();
-        if self.falhar_agenda.contains(&"habilitar") && self.tarefas {
+        if self.falhar_agenda.contains(&"desabilitar_2") && self.tarefas {
+            self.ev("desabilitar-parcial");
+            self.habilitadas[0] = false;
             return false;
         }
-        self.ev("habilitar");
-        self.habilitadas = true;
+        self.ev("desabilitar");
+        self.habilitadas = [false; 2];
         true
+    }
+    fn habilitar_tarefa(&mut self, i: usize) {
+        self.operacao();
+        if !self.tarefas {
+            return;
+        }
+        self.ev(format!("habilitar:{i}"));
+        let f = &mut self.falhas_habilitar[i];
+        if *f > 0 {
+            if *f != u32::MAX {
+                *f -= 1;
+            }
+            return;
+        }
+        if !self.habilitar_mente[i] {
+            self.habilitadas[i] = true;
+        }
+    }
+    fn tarefa_habilitada(&mut self, i: usize) -> Option<bool> {
+        self.operacao();
+        self.tarefas.then_some(self.habilitadas[i])
     }
 }
 
@@ -1350,7 +1379,9 @@ fn recuperacao_exaustiva() {
                                     assert!(m.c.concluido().is_file(), "{ctx}");
                                     assert!(!s.tarefas, "{ctx}");
                                 }
-                                Saida::Ocupada => unreachable!("corpo não sai ocupado"),
+                                Saida::Ocupada | Saida::SemRecuperacao => {
+                                    unreachable!("corpo não sai ocupado nem com 4")
+                                }
                                 Saida::Pendente => {
                                     assert!(!motivos.is_empty(), "pendente sem motivo conhecido: {ctx}");
                                     for x in &motivos {
@@ -1528,7 +1559,7 @@ const TF: Tarefas = Tarefas {
     religar: RELIGAR,
 };
 const TC: Tarefas = Tarefas {
-    fixas: &["C"],
+    fixas: &["C", "D"],
     religar: "R",
 };
 
@@ -1604,7 +1635,8 @@ fn bat_corpo_so_roda_com_a_trava() {
     let corpo = ls.iter().position(|l| *l == ":principal").unwrap();
     let chamadas: Vec<usize> = (0..ls.len()).filter(|i| ls[*i].contains(":principal")).collect();
     // automático, manual e religar: uma chamada cada (+ o rótulo)
-    assert_eq!(chamadas.len(), 4, "{chamadas:?}");
+    // religar: mais uma, a do caminho sem tarefas confirmadas (R6)
+    assert_eq!(chamadas.len(), 5, "{chamadas:?}");
     for i in chamadas.iter().filter(|i| **i != corpo) {
         assert_eq!(ls[*i], r#"call :principal 9>"%TROCA%\recuperar.lock""#);
         assert_eq!(ls[i - 1], r#"set "SAIDA=3""#);
@@ -1671,11 +1703,34 @@ fn bat_manual_desabilita_espera_a_trava_e_reabilita_na_falha() {
             assert!(!l.contains(proibido), "{l}");
         }
     }
-    // todo caminho que não é `Concluida` passa pela reabilitação antes de sair
+    // todo caminho que não é `Concluida` passa pela reabilitação CONFERIDA antes de sair (R6):
+    // `/ENABLE` seguido da consulta; só a consulta leva ao `_ok`; "reabilitadas" só depois do
+    // desvio por `H`; não confirmada = aviso + comando à mão + código 4
     let reab = pos(":manual_reabilitar");
-    for (j, tn) in TAREFAS.iter().enumerate() {
-        assert!(m[reab + 1 + 3 * j].starts_with(&format!(r#"schtasks /Change /TN "{tn}" /ENABLE"#)));
+    let sem_rel = pos(":manual_sem_religar");
+    let sem_rec = pos(":manual_sem_recuperacao");
+    for inicio in [reab, sem_rel] {
+        let bloco = &m[inicio + 1..];
+        assert_eq!(bloco[0], r#"set "H=0""#);
+        for tn in TAREFAS {
+            let e = bloco
+                .iter()
+                .position(|l| *l == format!(r#"schtasks /Change /TN "{tn}" /ENABLE >nul 2>&1"#))
+                .unwrap();
+            assert!(bloco[e + 1].starts_with(&consulta_habilitada(tn)), "{}", bloco[e + 1]);
+            assert!(bloco[e + 1].ends_with("_ok"), "{}", bloco[e + 1]);
+            assert!(!bloco[e].contains("goto"), "o código do /ENABLE não decide");
+        }
+        let h = bloco.iter().position(|l| l.starts_with(r#"if "%H%"=="1""#)).unwrap();
+        assert_eq!(bloco[h], r#"if "%H%"=="1" goto manual_sem_recuperacao"#);
+        assert!(bloco[h + 1].starts_with("echo recuperar: manual"), "{}", bloco[h + 1]);
+        assert!(bloco[h + 3] == "exit /b 1");
     }
+    assert!(m[sem_rec + 1].contains("NAO foi restabelecida"));
+    for tn in TAREFAS {
+        assert!(m[sem_rec..].iter().any(|l| *l == format!(r#"echo   schtasks /Change /TN "{tn}" /ENABLE"#)));
+    }
+    assert_eq!(*m.last().unwrap(), "exit /b 4");
     let ok = pos(":manual_ok");
     assert!(m[ok..reab].iter().any(|l| *l == "exit /b 0"));
     assert!(m[reab..].iter().any(|l| *l == "exit /b 1"));
@@ -1769,6 +1824,7 @@ fn bat_segue_os_tempos() {
         estavel: 9,
         renomear: 4,
         trava: 11,
+        habilitar: 6,
     };
     let b = script_recuperar(&caminhos_windows(), "A", "B", &TC, &t).unwrap();
     for trecho in [
@@ -1777,6 +1833,8 @@ fn bat_segue_os_tempos() {
         "if %N% GEQ 8 goto pendente",
         "if %N% GEQ 9 goto",
         "if %R% GEQ 4 exit /b 1",
+        "if %N% GEQ 6 goto _r1_0_nao",
+        "if %N% GEQ 6 goto _r1_1_nao",
     ] {
         assert!(b.contains(trecho), "{trecho}");
     }
@@ -1865,7 +1923,7 @@ fn disputar(
         if passo > 0
             && passo % cada == 0
             && s.tarefas
-            && s.habilitadas
+            && s.habilitadas[1]
             && !atores.iter().any(|a| a.0 == Ator::Minuto)
         {
             atores.push((Ator::Minuto, Exec::novo(&auto, &corpo)));
@@ -2018,7 +2076,7 @@ fn falhou_preexistente_presa_e_afastada() {
         } else {
             assert_eq!(saida, Saida::Pendente, "{ctx}");
             assert_eq!(ler(&m.c.anterior.join(EXE)), "BOM Anterior", "{ctx}");
-            assert!(s.tarefas && s.habilitadas && !m.c.concluido().exists(), "{ctx}");
+            assert!(s.tarefas && s.hab() && !m.c.concluido().exists(), "{ctx}");
         }
         for n in 1..=ocupadas {
             assert_eq!(ler(&m.c.afastada(n).join(EXE)), format!("RUIM antiga {n}"), "{ctx}");
@@ -2032,7 +2090,7 @@ fn falhou_preexistente_presa_e_afastada() {
     assert_eq!(manual(&m, &mut s), Saida::Pendente);
     assert_eq!(ler(&m.c.anterior.join(EXE)), "BOM Anterior");
     assert_eq!(ler(&m.c.falhou.join(EXE)), "RUIM Falhou");
-    assert!(s.tarefas && s.habilitadas);
+    assert!(s.tarefas && s.hab());
 }
 
 /// Falhas do manual fora do corpo: sem `religar` não mexe em nada; não desabilitou, trava que
@@ -2054,11 +2112,12 @@ fn manual_que_falha_reabilita_as_tarefas() {
         let ev = s.eventos();
         let ctx = format!("{caso}: {saida:?} {ev:?}");
         assert_eq!(saida, Saida::Pendente, "{ctx}");
-        assert!(s.tarefas && s.habilitadas, "{ctx}");
+        assert!(s.tarefas && s.hab(), "{ctx}");
         assert!(!m.c.concluido().exists(), "{ctx}");
         match caso {
             "criar_religar" => {
-                assert!(!s.religar && !ev.iter().any(|e| e == "desabilitar" || e == "habilitar"), "{ctx}");
+                // nada desabilitado; as fixas só são conferidas (R6)
+                assert!(!s.religar && !ev.iter().any(|e| e.starts_with("desabilitar")), "{ctx}");
             }
             "trava_presa" => {
                 let n = ev.iter().filter(|e| *e == "trava-ocupada").count() as u32;
@@ -2070,9 +2129,12 @@ fn manual_que_falha_reabilita_as_tarefas() {
             assert_eq!(pastas(&m), antes, "{ctx}");
             assert!(!ev.iter().any(|e| e == "parar" || e.starts_with("ren")), "{ctx}");
         }
-        if caso != "criar_religar" {
-            // `habilitar` depois de `desabilitar` (quando houve)
-            let h = ev.iter().rposition(|e| e == "habilitar").expect("reabilitou");
+        {
+            // `habilitar` (das duas fixas) depois de `desabilitar` (quando houve)
+            for i in 0..2 {
+                assert!(ev.contains(&format!("habilitar:{i}")), "{ctx}");
+            }
+            let h = ev.iter().rposition(|e| e.starts_with("habilitar")).expect("reabilitou");
             assert!(ev.iter().position(|e| e == "desabilitar").map_or(true, |d| d < h), "{ctx}");
         }
     }
@@ -2105,7 +2167,7 @@ fn queda_em_cada_passo_da_recuperacao_manual() {
                 assert!(caiu, "{estado:?} k={k}");
                 assert!(alguma_utilizavel(&m.c), "{estado:?} k={k}");
                 let ctx = format!(
-                    "{estado:?} k={k}/{total} reboot={reboot} tarefas={} habilitadas={} religar={}",
+                    "{estado:?} k={k}/{total} reboot={reboot} tarefas={} habilitadas={:?} religar={}",
                     s.tarefas, s.habilitadas, s.religar
                 );
                 if reboot {
@@ -2122,9 +2184,9 @@ fn queda_em_cada_passo_da_recuperacao_manual() {
                     if s2.religar {
                         roda(programa_religar(), &mut s2);
                     }
-                    for _ in 0..3 {
-                        // ao iniciar e depois a de minuto
-                        if s2.tarefas && s2.habilitadas {
+                    for n in 0..3 {
+                        // ao iniciar (fixa 0) e depois a de minuto (fixa 1)
+                        if s2.tarefas && s2.habilitadas[n.min(1)] {
                             roda(programa_automatico(), &mut s2);
                         }
                     }
@@ -2156,7 +2218,15 @@ fn modos_invalidos_sao_recusados() {
     validar_modos(&Modos::padrao()).unwrap();
     // corpo não pode mexer na agenda nem pegar a trava de novo
     let mut m = Modos::padrao();
-    m.corpo.insert(0, HabilitarTarefas);
+    m.corpo.insert(0, HabilitarTarefas { falha: "pendente" });
+    assert!(validar_modos(&m).is_err());
+    let mut m = Modos::padrao();
+    m.corpo.insert(0, ComoReabilitar);
+    assert!(validar_modos(&m).is_err());
+    // "sem recuperação" é dos modos: o corpo não pode sair com 4
+    let mut m = Modos::padrao();
+    let fim = m.corpo.len() - 1;
+    m.corpo[fim] = Sair(Saida::SemRecuperacao);
     assert!(validar_modos(&m).is_err());
     // modo não pode mexer em pasta/serviço fora da trava
     for p in [PararServico, Apagar(Pasta::Falhou), ApagarTarefas, SubirEstavel { falha: "manual_ok" }] {
@@ -2171,4 +2241,239 @@ fn modos_invalidos_sao_recusados() {
     let mut m = Modos::padrao();
     m.manual.insert(0, Rotulo("principal"));
     assert!(validar_modos(&m).is_err());
+}
+
+// ---------------------------------------------------------------------------------------
+// R6, item 1: reabilitação conferida das tarefas fixas.
+// ---------------------------------------------------------------------------------------
+
+/// Manual com corpo pendente (serviço quebrado) e a agenda instável de propósito.
+fn manual_pendente_com(falhas: [u32; 2], mente: [bool; 2]) -> (Saida, Falso, Mini) {
+    let m = Mini::novo([Some("RUIM"), Some("BOM"), None], false);
+    let mut s = Falso::novo(&m.c);
+    s.quebrado = true;
+    s.falhas_habilitar = falhas;
+    s.habilitar_mente = mente;
+    let x = manual(&m, &mut s);
+    (x, s, m)
+}
+
+fn tentativas(s: &Falso, i: usize) -> u32 {
+    s.eventos().iter().filter(|e| **e == format!("habilitar:{i}")).count() as u32
+}
+
+/// Falha transitória (menos que `Tempos::habilitar`): repete, confirma e só então diz
+/// "reabilitadas" (`Pendente`, código 1).
+#[test]
+fn reabilitacao_transitoria_e_repetida_e_confirmada() {
+    let (x, s, _m) = manual_pendente_com([T0.habilitar - 1, 1], [false; 2]);
+    assert_eq!(x, Saida::Pendente, "{:?}", s.eventos());
+    assert_eq!(x.codigo(), 1);
+    assert!(s.tarefas && s.hab());
+    assert_eq!(tentativas(&s, 0), T0.habilitar);
+    assert_eq!(tentativas(&s, 1), 2);
+}
+
+/// Reabilitação parcial (uma fixa nunca pega) e persistente (nenhuma pega), e o `/ENABLE`
+/// que "dá certo" sem habilitar: tenta todas, a que pegou fica habilitada, e a saída é
+/// `SemRecuperacao` (código 4) com o comando para religar à mão — nunca "reabilitadas".
+#[test]
+fn reabilitacao_parcial_ou_persistente_sai_sem_recuperacao() {
+    let max = u32::MAX;
+    for (falhas, mente) in [
+        ([0, max], [false, false]),
+        ([max, 0], [false, false]),
+        ([max, max], [false, false]),
+        ([0, 0], [false, true]),
+        ([0, 0], [true, true]),
+    ] {
+        let (x, s, m) = manual_pendente_com(falhas, mente);
+        let ctx = format!("{falhas:?} {mente:?} {x:?} {:?}", s.eventos());
+        assert_eq!(x, Saida::SemRecuperacao, "{ctx}");
+        assert_eq!(x.codigo(), 4, "{ctx}");
+        assert!(s.tarefas && !m.c.concluido().exists(), "{ctx}");
+        for i in 0..2 {
+            let ruim = falhas[i] == max || mente[i];
+            assert_eq!(s.habilitadas[i], !ruim, "{ctx} fixa {i}");
+            // a que falha é tentada `Tempos::habilitar` vezes; a outra, uma
+            assert_eq!(tentativas(&s, i), if ruim { T0.habilitar } else { 1 }, "{ctx} fixa {i}");
+        }
+        // `religar` continua registrada: o próximo boot tenta de novo
+        assert!(s.religar, "{ctx}");
+    }
+}
+
+/// O modo manual em cada falha da agenda: a saída nunca é "reabilitadas" sem as duas fixas
+/// habilitadas, e `SemRecuperacao` só quando alguma ficou desabilitada.
+#[test]
+fn manual_so_anuncia_reabilitadas_com_as_duas_confirmadas() {
+    let max = u32::MAX;
+    for caso in ["criar_religar", "desabilitar", "desabilitar_2", "trava_presa", "corpo_pendente"] {
+        for falhas in [[0, 0], [1, 0], [0, max], [max, max]] {
+            let m = Mini::novo([Some("RUIM"), Some("BOM"), None], false);
+            let mut s = Falso::novo(&m.c);
+            match caso {
+                "trava_presa" => s.donos = 1,
+                "corpo_pendente" => s.quebrado = true,
+                c => s.falhar_agenda.push(c),
+            }
+            // as fixas deixadas desabilitadas por um manual anterior que caiu: mesmo sem nada
+            // a desabilitar (falha em `criar_religar`/`desabilitar`) o manual as confere
+            s.habilitadas = [false, false];
+            s.falhas_habilitar = falhas;
+            let x = manual(&m, &mut s);
+            let ctx = format!("{caso} {falhas:?} {x:?} {:?}", s.eventos());
+            match x {
+                Saida::Pendente => assert!(s.hab(), "{ctx}"),
+                Saida::SemRecuperacao => assert!(!s.hab(), "{ctx}"),
+                _ => panic!("{ctx}"),
+            }
+            assert_eq!(x == Saida::Pendente, !falhas.contains(&max), "{ctx}");
+            if caso == "desabilitar_2" {
+                let ev = s.eventos();
+                let d = ev.iter().position(|e| e == "desabilitar-parcial").unwrap();
+                assert!(ev.iter().rposition(|e| e == "habilitar:0").unwrap() > d, "{ctx}");
+            }
+        }
+    }
+}
+
+/// `religar` (ao iniciar) reabilita as DUAS fixas — inclusive a de minuto — antes do corpo;
+/// fixa não confirmada: o corpo roda assim mesmo; concluiu = 0 (tarefas apagadas); não
+/// concluiu = 4.
+#[test]
+fn religar_reabilita_as_duas_e_sinaliza_a_que_nao_pegou() {
+    for (falhas, quebrado, esperado) in [
+        ([0, 0], true, Saida::Pendente),
+        ([0, 2], true, Saida::Pendente),
+        ([0, u32::MAX], true, Saida::SemRecuperacao),
+        ([u32::MAX, 0], true, Saida::SemRecuperacao),
+        ([0, u32::MAX], false, Saida::Concluida),
+    ] {
+        let m = Mini::novo([Some("RUIM"), Some("BOM"), None], false);
+        let mut s = Falso::novo(&m.c);
+        s.estado = Servico::Parado;
+        s.habilitadas = [false; 2];
+        s.religar = true;
+        s.quebrado = quebrado;
+        s.falhas_habilitar = falhas;
+        let x = executar(&programa_religar(), &m.c, EXE, &mut s, &T0, &mut |_, _| {});
+        let ctx = format!("{falhas:?} {x:?} {:?}", s.eventos());
+        assert_eq!(x, esperado, "{ctx}");
+        let ev = s.eventos();
+        let primeira_trava = ev.iter().position(|e| e == "travou").unwrap();
+        for i in 0..2 {
+            let h = ev.iter().position(|e| *e == format!("habilitar:{i}")).unwrap();
+            assert!(h < primeira_trava, "{ctx}");
+        }
+        match x {
+            Saida::Concluida => {
+                ativo_utilizavel(&m.c, &s).unwrap();
+                assert!(!s.tarefas && !s.religar, "{ctx}");
+            }
+            _ => assert!(s.tarefas && s.religar && s.habilitadas[0] == (falhas[0] != u32::MAX), "{ctx}"),
+        }
+    }
+}
+
+/// Tarefa que não existe: só é aceita se `concluido` existe (uma execução concluiu e a
+/// apagou); senão é "não confirmada".
+#[test]
+fn tarefa_ausente_so_conta_com_concluido() {
+    let m = Mini::novo([Some("BOM"), None, None], false);
+    let mut s = Falso::novo(&m.c);
+    s.tarefas = false;
+    assert!(!habilitar_e_conferir(&m.c, &mut s, &T0));
+    fs::write(m.c.concluido(), "ok").unwrap();
+    assert!(habilitar_e_conferir(&m.c, &mut s, &T0));
+}
+
+/// Um `Sistema` sem agenda (o padrão da trait) nunca confirma.
+#[test]
+fn sistema_sem_agenda_nao_confirma() {
+    struct Mudo;
+    impl Sistema for Mudo {
+        fn servico(&mut self) -> Servico {
+            Servico::Parado
+        }
+        fn parar_servico(&mut self) {}
+        fn iniciar_servico(&mut self) {}
+        fn encerrar_processos(&mut self) {}
+        fn renomear(&mut self, _: &Path, _: &Path) -> io::Result<()> {
+            Ok(())
+        }
+        fn esperar(&mut self, _: Duration) {}
+        fn apagar_tarefas(&mut self) {}
+    }
+    let m = Mini::novo([Some("BOM"), None, None], false);
+    assert!(!habilitar_e_conferir(&m.c, &mut Mudo, &T0));
+}
+
+/// Nomes de tarefa que quebrariam a consulta do PowerShell (aspas, curingas) são recusados.
+#[test]
+fn bat_recusa_tarefa_ruim_para_o_powershell() {
+    let c = caminhos_windows();
+    for ruim in ["C'x", "C*", "C?", "C[1]", "C`x", "C$x"] {
+        let t = Tarefas { fixas: &[ruim, "D"], religar: "R" };
+        assert!(script_recuperar(&c, "A", "B", &t, &T0).is_err(), "{ruim}");
+    }
+    let t = Tarefas { fixas: &["C"], religar: "R" };
+    assert!(script_recuperar(&c, "A", "B", &t, &T0).is_err(), "só uma fixa");
+    let b = script_recuperar(&c, "A", "B", &TC, &T0).unwrap();
+    assert!(b.contains(r#"-TaskPath '\' -TaskName 'C' -ErrorAction Stop).Settings.Enabled"#));
+}
+
+// ---------------------------------------------------------------------------------------
+// R6, item 2: pontos de parada da bancada.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn ponto_de_bancada_para_so_na_fase_pedida_e_libera_pelo_arquivo() {
+    use bancada::{pedida, ponto_com};
+    let dir = tmp();
+    let curta = Duration::from_millis(1);
+    assert!(!ponto_com("entre_ren", None, &dir, curta, Some(0)));
+    assert!(!ponto_com("entre_ren", Some("antes_subir"), &dir, curta, Some(0)));
+    assert!(pedida("entre_ren", "antes_subir, entre_ren"));
+    assert!(pedida("antes_parar", "TODAS"));
+    assert!(!pedida("entre_ren", "entre"));
+    // pedida e sem `liberar-`: fica parada (aqui, até o limite) com o PID no `parado-`
+    assert!(ponto_com("entre_ren", Some("entre_ren"), &dir, curta, Some(3)));
+    let parado = ler(&dir.join("parado-entre_ren.txt"));
+    assert!(parado.contains(&format!("pid={}", std::process::id())), "{parado}");
+    // `liberar-` criado por outro processo: segue e limpa os dois
+    fs::write(dir.join("liberar-entre_ren"), "").unwrap();
+    assert!(ponto_com("entre_ren", Some("entre_ren"), &dir, curta, None));
+    assert!(!dir.join("liberar-entre_ren").exists() && !dir.join("parado-entre_ren.txt").exists());
+    let _ = fs::remove_dir_all(&dir);
+    // toda fase usada no código está na lista (os nomes do roteiro)
+    for f in FASES_BANCADA {
+        assert!(nome_simples(f) && !f.contains(' '), "{f}");
+    }
+}
+
+/// Build normal (sem `--features bancada-pausas`): `ponto_bancada` é vazia — com a variável
+/// definida e a pasta de controle sem `liberar-`, nenhuma fase para nem cria arquivo.
+#[cfg(not(feature = "bancada-pausas"))]
+#[test]
+fn build_normal_nao_tem_pausas() {
+    assert!(!PAUSAS_DE_BANCADA);
+    let dir = tmp();
+    std::env::set_var(bancada::VAR_PAUSA, "todas");
+    std::env::set_var(bancada::VAR_DIR, &dir);
+    let t = std::time::Instant::now();
+    for f in FASES_BANCADA {
+        ponto_bancada(f);
+    }
+    std::env::remove_var(bancada::VAR_PAUSA);
+    std::env::remove_var(bancada::VAR_DIR);
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "criou arquivo de pausa");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "bancada-pausas")]
+#[test]
+fn build_de_bancada_tem_pausas() {
+    assert!(PAUSAS_DE_BANCADA);
 }

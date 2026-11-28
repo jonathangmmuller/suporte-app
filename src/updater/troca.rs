@@ -454,11 +454,19 @@ pub(crate) trait Sistema {
     fn desabilitar_tarefas(&mut self) -> bool {
         false
     }
-    /// Reabilita as tarefas fixas que existem; `false` = alguma ficou desabilitada.
-    fn habilitar_tarefas(&mut self) -> bool {
-        false
+    /// `schtasks /Change /ENABLE` na fixa `i` (0 = ao iniciar, 1 = de minuto). O resultado do
+    /// comando não decide nada: quem decide é `tarefa_habilitada`, consultada em seguida.
+    fn habilitar_tarefa(&mut self, _i: usize) {}
+    /// Consulta da fixa `i`: `Some(true)` = existe e está habilitada; `Some(false)` = existe e
+    /// está desabilitada (ou a consulta falhou); `None` = não existe. O padrão (`Some(false)`)
+    /// nunca confirma, de modo que um `Sistema` sem agenda leva a `SemRecuperacao`.
+    fn tarefa_habilitada(&mut self, _i: usize) -> Option<bool> {
+        Some(false)
     }
 }
+
+/// As tarefas fixas da recuperação: ao iniciar (índice 0) e a cada minuto (índice 1).
+pub(crate) const TAREFAS_FIXAS: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tempos {
@@ -474,6 +482,8 @@ pub(crate) struct Tempos {
     /// Modo `manual`: novas tentativas (uma a cada 3 `passo`s) de pegar a trava enquanto
     /// outra execução (guarda, tarefa, troca) a segura.
     pub trava: u32,
+    /// Tentativas de reabilitar e confirmar cada tarefa fixa (2 `passo`s entre elas).
+    pub habilitar: u32,
 }
 
 impl Tempos {
@@ -486,6 +496,8 @@ impl Tempos {
         renomear: 20,
         // 400 × 3 s = 20 min: mais que o pior caso de uma execução (≈ 8 min).
         trava: 400,
+        // 5 × (≈ 2 s + consulta): o serviço de agenda ocupado por instantes não vira falha.
+        habilitar: 5,
     };
 }
 
@@ -580,17 +592,20 @@ fn religado(s: &mut dyn Sistema, religar: bool, t: &Tempos, r: Resultado) -> Res
 /// rodando antes e precisa estar rodando depois. Toda partida é confirmada (`subir_estavel`);
 /// sem confirmação o resultado é `Critico`.
 pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempos) -> Resultado {
+    ponto_bancada("antes_parar");
     s.parar_servico();
     if !esperar_estado(s, Servico::Parado, t.parar, t) {
         log::warn!("[portal-update] serviço não parou a tempo; encerrando processos");
     }
     s.encerrar_processos();
 
+    ponto_bancada("antes_ren_atual");
     if let Err(e) = renomear_tentando(s, &c.atual, &c.anterior, t.renomear, t) {
         // Nada mudou no disco.
         let r = Resultado::NaoTrocado(format!("instalação atual presa: {e}"));
         return religado(s, religar, t, r);
     }
+    ponto_bancada("entre_ren");
     if let Err(e) = renomear_tentando(s, &c.novo, &c.atual, t.renomear, t) {
         return match renomear_tentando(s, &c.anterior, &c.atual, t.renomear * 3, t) {
             Ok(()) => {
@@ -602,6 +617,7 @@ pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempo
             )),
         };
     }
+    ponto_bancada("antes_subir");
     if !religar || subir_estavel(s, t) {
         return Resultado::Atualizado;
     }
@@ -627,6 +643,101 @@ pub(crate) fn trocar(c: &Caminhos, s: &mut dyn Sistema, religar: bool, t: &Tempo
     }
     let r = Resultado::Revertido("serviço da versão nova não ficou RUNNING".to_owned());
     religado(s, true, t, r)
+}
+
+// ---------------------------------------------------------------------------------------
+// Pontos de parada da bancada (R6, item 2). Só existem no build com a feature de compilação
+// `bancada-pausas` (desligada no build normal e no de release): sem ela, `ponto_bancada` é
+// vazia e o módulo `bancada` (com o nome da variável de ambiente) nem é compilado.
+// ---------------------------------------------------------------------------------------
+
+/// `true` só no build de bancada. O teste `build_normal_nao_tem_pausas` usa isto.
+pub(crate) const PAUSAS_DE_BANCADA: bool = cfg!(feature = "bancada-pausas");
+
+/// Fases em que a bancada pode parar o atualizador, na ordem em que ocorrem.
+pub(crate) const FASES_BANCADA: [&str; 10] = [
+    "antes_preparar",
+    "antes_scripts",
+    "antes_tarefas",
+    "antes_guarda",
+    "antes_iniciada",
+    "antes_parar",
+    "antes_ren_atual",
+    "entre_ren",
+    "antes_subir",
+    "antes_concluido",
+];
+
+/// Build de bancada: para na `fase` se pedida (ver `bancada::ponto_com`). Build normal: nada.
+#[cfg(feature = "bancada-pausas")]
+pub(crate) fn ponto_bancada(fase: &str) {
+    bancada::ponto(fase)
+}
+
+/// Build normal: vazia (nem lê variável de ambiente).
+#[cfg(not(feature = "bancada-pausas"))]
+#[inline(always)]
+pub(crate) fn ponto_bancada(fase: &str) {
+    debug_assert!(FASES_BANCADA.contains(&fase), "fase de bancada desconhecida: {fase}");
+}
+
+#[cfg(any(feature = "bancada-pausas", test))]
+pub(crate) mod bancada {
+    use hbb_common::log;
+    use std::{path::Path, time::Duration};
+
+    /// Lista de fases separadas por vírgula, ou `todas`.
+    pub(crate) const VAR_PAUSA: &str = "SUPORTE_BANCADA_PAUSA";
+    /// Pasta dos arquivos de controle (padrão `C:\bancada\pausa`).
+    pub(crate) const VAR_DIR: &str = "SUPORTE_BANCADA_DIR";
+
+    #[cfg(feature = "bancada-pausas")]
+    pub(crate) fn ponto(fase: &str) {
+        let lista = std::env::var(VAR_PAUSA).ok();
+        let dir = std::env::var_os(VAR_DIR).unwrap_or_else(|| r"C:\bancada\pausa".into());
+        ponto_com(fase, lista.as_deref(), Path::new(&dir), Duration::from_millis(200), None);
+    }
+
+    pub(crate) fn pedida(fase: &str, lista: &str) -> bool {
+        lista
+            .split(',')
+            .map(str::trim)
+            .any(|f| f.eq_ignore_ascii_case("todas") || f == fase)
+    }
+
+    /// Fase pedida: grava `<dir>\parado-<fase>.txt` (com o PID deste processo, para o
+    /// `taskkill /PID`) e espera até existir `<dir>\liberar-<fase>`, que apaga junto com o
+    /// `parado-`. `limite` = máximo de consultas (testes); `None` = sem limite (a guarda encerra
+    /// o processo depois de ≈ 20 min). Devolve se parou.
+    pub(crate) fn ponto_com(
+        fase: &str,
+        lista: Option<&str>,
+        dir: &Path,
+        espera: Duration,
+        limite: Option<u32>,
+    ) -> bool {
+        let Some(lista) = lista else { return false };
+        if !pedida(fase, lista) {
+            return false;
+        }
+        let parado = dir.join(format!("parado-{fase}.txt"));
+        let liberar = dir.join(format!("liberar-{fase}"));
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&parado, format!("pid={}\r\nfase={fase}\r\n", std::process::id()));
+        log::warn!("[portal-update] BANCADA: parado em {fase}; crie {liberar:?} para seguir");
+        let mut n = 0u32;
+        while !liberar.exists() {
+            if limite.map_or(false, |l| n >= l) {
+                return true;
+            }
+            n += 1;
+            std::thread::sleep(espera);
+        }
+        let _ = std::fs::remove_file(&liberar);
+        let _ = std::fs::remove_file(&parado);
+        log::warn!("[portal-update] BANCADA: liberado em {fase}");
+        true
+    }
 }
 
 /// Pontos em que a proteção das pastas é conferida de novo (achado 1).
@@ -660,6 +771,7 @@ pub(crate) fn atualizar(
         antes_de_parar()?;
         conferir(Momento::AntesDeTrocar)?;
         // Recuperação registrada e conferida: daqui em diante a troca é dela (achado 2).
+        ponto_bancada("antes_iniciada");
         gravar_marcador(&c.iniciada())
     });
     if let Err(e) = antes {
@@ -709,14 +821,19 @@ pub(crate) enum Saida {
     Pendente,
     /// Outra execução segura a trava: nada foi tocado (código 3).
     Ocupada,
+    /// Só nos modos (R6, item 1): a recuperação não concluiu E alguma tarefa fixa não foi
+    /// confirmada habilitada depois das novas tentativas. A recuperação automática NÃO está
+    /// restabelecida; o BAT mostra o comando para religar à mão (código 4).
+    SemRecuperacao,
 }
 
 impl Saida {
-    fn codigo(self) -> u8 {
+    pub(crate) fn codigo(self) -> u8 {
         match self {
             Saida::Concluida => 0,
             Saida::Pendente => 1,
             Saida::Ocupada => 3,
+            Saida::SemRecuperacao => 4,
         }
     }
 }
@@ -750,8 +867,14 @@ pub(crate) enum Passo {
     CriarReligar { falha: &'static str },
     /// `schtasks /Change /DISABLE` em cada tarefa fixa que existe (sumiu = ok).
     DesabilitarTarefas { falha: &'static str },
-    /// `schtasks /Change /ENABLE` em cada tarefa fixa que existe (erro só registrado).
-    HabilitarTarefas,
+    /// Para cada tarefa fixa: `schtasks /Change /ENABLE` e consulta (PowerShell,
+    /// `Settings.Enabled`), repetindo `Tempos::habilitar` vezes. Passa adiante se TODAS foram
+    /// confirmadas habilitadas (ou não existem e `concluido` existe: uma execução concluiu e as
+    /// apagou); senão, depois de tentar todas, vai para `falha` (R6, item 1).
+    HabilitarTarefas { falha: &'static str },
+    /// Mostra e registra que a recuperação automática NÃO foi restabelecida, com o comando para
+    /// religar cada tarefa fixa à mão.
+    ComoReabilitar,
     /// Pega a trava e roda o corpo (`programa_recuperar`) com ela; solta ao sair dele.
     /// Ocupada: `esperar` = tenta de novo `Tempos::trava` vezes (3 s cada); senão desiste.
     ComTrava {
@@ -784,7 +907,8 @@ impl Passo {
             self,
             Passo::CriarReligar { .. }
                 | Passo::DesabilitarTarefas { .. }
-                | Passo::HabilitarTarefas
+                | Passo::HabilitarTarefas { .. }
+                | Passo::ComoReabilitar
                 | Passo::ComTrava { .. }
         )
     }
@@ -796,7 +920,8 @@ impl Passo {
             | Passo::SubirEstavel { falha }
             | Passo::MarcarConcluido { falha }
             | Passo::CriarReligar { falha }
-            | Passo::DesabilitarTarefas { falha } => vec![falha],
+            | Passo::DesabilitarTarefas { falha }
+            | Passo::HabilitarTarefas { falha } => vec![falha],
             Passo::ComTrava { concluida, pendente, ocupada, .. } => vec![concluida, pendente, ocupada],
             _ => vec![],
         }
@@ -882,8 +1007,14 @@ pub(crate) fn programa_automatico() -> Vec<Passo> {
 ///    roda o corpo, este modo não entra; depois que entra, nenhuma delas entra (saem com 3);
 /// 4. roda o mesmo corpo; as tarefas (e `religar`) só são apagadas por ele, depois de RUNNING
 ///    estável e `concluido`; a trava é solta ao sair do corpo;
-/// 5. corpo pendente, trava que não veio ou falha ao desabilitar: reabilita as tarefas (a
-///    recuperação automática retoma no próximo minuto) e sai com 1.
+/// 5. corpo pendente, trava que não veio ou falha ao desabilitar: reabilita as tarefas e
+///    CONFIRMA por consulta que as duas fixas ficaram habilitadas (com novas tentativas); só
+///    então diz "reabilitadas" e sai com 1 (a recuperação automática retoma no próximo minuto);
+/// 6. sem `religar` registrada: nada foi desabilitado, mas confere do mesmo jeito que as fixas
+///    estão habilitadas (uma execução anterior que caiu pode tê-las deixado desabilitadas);
+/// 7. alguma fixa não confirmada (R6, item 1): diz que a recuperação automática NÃO foi
+///    restabelecida, mostra o comando para religar à mão e sai com 4 (`SemRecuperacao`). A
+///    `religar` continua registrada: no próximo boot ela tenta de novo.
 pub(crate) fn programa_manual() -> Vec<Passo> {
     use Passo::*;
     vec![
@@ -901,22 +1032,28 @@ pub(crate) fn programa_manual() -> Vec<Passo> {
         Aviso("manual concluida servico rodando tarefas apagadas"),
         Sair(Saida::Concluida),
         Rotulo("manual_reabilitar"),
-        HabilitarTarefas,
-        Aviso("manual pendente tarefas reabilitadas"),
+        HabilitarTarefas { falha: "manual_sem_recuperacao" },
+        Aviso("manual pendente tarefas reabilitadas e conferidas"),
         Sair(Saida::Pendente),
         Rotulo("manual_sem_religar"),
-        Aviso("manual sem a tarefa religar nada foi mudado"),
+        HabilitarTarefas { falha: "manual_sem_recuperacao" },
+        Aviso("manual sem a tarefa religar nada foi mudado tarefas conferidas"),
         Sair(Saida::Pendente),
+        Rotulo("manual_sem_recuperacao"),
+        ComoReabilitar,
+        Sair(Saida::SemRecuperacao),
     ]
 }
 
-/// `recuperar.bat religar` (tarefa ao iniciar criada pelo modo manual): reabilita as tarefas
-/// fixas e roda o automático. Fica registrada até o corpo concluir (que a apaga).
+/// `recuperar.bat religar` (tarefa ao iniciar criada pelo modo manual): reabilita e confere as
+/// duas tarefas fixas — inclusive a de minuto — e roda o automático. Fica registrada até o
+/// corpo concluir (que a apaga). Fixa não confirmada: registra o comando para religar à mão e
+/// roda o corpo assim mesmo (é a única chance deste boot); se ele não concluir, sai com 4.
 pub(crate) fn programa_religar() -> Vec<Passo> {
     use Passo::*;
     vec![
         Log("religar"),
-        HabilitarTarefas,
+        HabilitarTarefas { falha: "religar_sem_tarefas" },
         ComTrava {
             esperar: false,
             concluida: "religar_ok",
@@ -929,6 +1066,16 @@ pub(crate) fn programa_religar() -> Vec<Passo> {
         Sair(Saida::Pendente),
         Rotulo("religar_ocupado"),
         Sair(Saida::Ocupada),
+        Rotulo("religar_sem_tarefas"),
+        ComoReabilitar,
+        ComTrava {
+            esperar: false,
+            concluida: "religar_ok",
+            pendente: "religar_sem_recuperacao",
+            ocupada: "religar_sem_recuperacao",
+        },
+        Rotulo("religar_sem_recuperacao"),
+        Sair(Saida::SemRecuperacao),
     ]
 }
 
@@ -1004,7 +1151,11 @@ pub(crate) fn validar_modos(m: &Modos) -> ResultType<()> {
     ] {
         validar_programa(prog).map_err(|e| anyhow!("{nome}: {e}"))?;
         for p in prog.iter() {
-            if corpo && (p.do_modo() || *p == Passo::Sair(Saida::Ocupada)) {
+            if corpo
+                && (p.do_modo()
+                    || *p == Passo::Sair(Saida::Ocupada)
+                    || *p == Passo::Sair(Saida::SemRecuperacao))
+            {
                 bail!("{nome}: {p:?} não pode rodar com a trava");
             }
             if !corpo && p.do_corpo() {
@@ -1165,11 +1316,15 @@ impl<'p> Exec<'p> {
                     salto = Some(falha);
                 }
             }
-            Passo::HabilitarTarefas => {
-                if !s.habilitar_tarefas() {
-                    log::warn!("[portal-update] recuperar: tarefa não reabilitada");
+            Passo::HabilitarTarefas { falha } => {
+                if !habilitar_e_conferir(c, s, t) {
+                    salto = Some(falha);
                 }
             }
+            Passo::ComoReabilitar => log::error!(
+                "[portal-update] recuperar: ATENÇÃO, a recuperação automática NÃO foi \
+                 restabelecida; religar as tarefas à mão (schtasks /Change /ENABLE)"
+            ),
             Passo::Sair(x) => return (aqui, passo, Some(x)),
         }
         if let Some(r) = salto {
@@ -1177,6 +1332,32 @@ impl<'p> Exec<'p> {
         }
         (aqui, passo, None)
     }
+}
+
+/// `HabilitarTarefas` (mesma sequência do BAT): para cada fixa, até `Tempos::habilitar`
+/// tentativas de `/ENABLE` + consulta, 2 `passo`s entre elas; tenta TODAS mesmo que uma falhe.
+/// Não confirmada só é aceita se a tarefa não existe e `concluido` existe.
+fn habilitar_e_conferir(c: &Caminhos, s: &mut dyn Sistema, t: &Tempos) -> bool {
+    let mut todas = true;
+    for i in 0..TAREFAS_FIXAS {
+        let n = t.habilitar.max(1);
+        let mut ok = false;
+        for k in 0..n {
+            s.habilitar_tarefa(i);
+            if s.tarefa_habilitada(i) == Some(true) {
+                ok = true;
+                break;
+            }
+            if k + 1 < n {
+                s.esperar(t.passo * 2);
+            }
+        }
+        if !ok && !(c.concluido().exists() && s.tarefa_habilitada(i).is_none()) {
+            log::error!("[portal-update] recuperar: tarefa fixa {i} não confirmada habilitada");
+            todas = false;
+        }
+    }
+    todas
 }
 
 /// Roda `prog` até o fim (corpo: `programa_recuperar`). `apos` é chamado depois de cada passo
@@ -1360,15 +1541,45 @@ impl Gerador<'_> {
                         l.push(format!(":{k}_{j}"));
                     }
                 }
-                Passo::HabilitarTarefas => {
+                Passo::HabilitarTarefas { falha } => {
+                    // Código de saída do `/ENABLE` não decide: só a consulta confirma. A
+                    // consulta lê `Settings.Enabled` (não depende do idioma do Windows); erro
+                    // na consulta = não confirmada. Tenta todas e só no fim desvia.
+                    let n = t.habilitar.max(1);
+                    l.push(r#"set "H=0""#.into());
                     for (j, tn) in self.tarefas.fixas.iter().enumerate() {
-                        l.push(format!(
-                            r#"schtasks /Change /TN "{tn}" /ENABLE >nul 2>&1 && goto {k}_{j}"#
-                        ));
-                        l.push(format!(
-                            r#"schtasks /Query /TN "{tn}" >nul 2>&1 && echo %DATE% %TIME% recuperar nao reabilitou {tn} {log}"#
-                        ));
+                        l.push("set /a N=0".into());
                         l.push(format!(":{k}_{j}"));
+                        l.push(format!(r#"schtasks /Change /TN "{tn}" /ENABLE >nul 2>&1"#));
+                        l.push(format!("{} >nul 2>&1 && goto {k}_{j}_ok", consulta_habilitada(tn)));
+                        l.push("set /a N+=1".into());
+                        l.push(format!("if %N% GEQ {n} goto {k}_{j}_nao"));
+                        l.push("ping -n 3 127.0.0.1 >nul".into());
+                        l.push(format!("goto {k}_{j}"));
+                        l.push(format!(":{k}_{j}_nao"));
+                        l.push(format!(
+                            r#"if not exist "%TROCA%\{MARCADOR_CONCLUIDO}" goto {k}_{j}_falhou"#
+                        ));
+                        l.push(format!(r#"schtasks /Query /TN "{tn}" >nul 2>&1 || goto {k}_{j}_ok"#));
+                        l.push(format!(":{k}_{j}_falhou"));
+                        l.push(format!(
+                            "echo %DATE% %TIME% recuperar tarefa nao confirmada habilitada {tn} {log}"
+                        ));
+                        l.push(r#"set "H=1""#.into());
+                        l.push(format!(":{k}_{j}_ok"));
+                    }
+                    l.push(format!(r#"if "%H%"=="1" goto {falha}"#));
+                }
+                Passo::ComoReabilitar => {
+                    let aviso = "ATENCAO a recuperacao automatica NAO foi restabelecida";
+                    l.push(format!("echo recuperar: {aviso}"));
+                    l.push(format!("echo %DATE% %TIME% recuperar {aviso} {log}"));
+                    l.push("echo recuperar: religue a mao como administrador e confira:".into());
+                    for tn in self.tarefas.fixas {
+                        let cmd = format!(r#"schtasks /Change /TN "{tn}" /ENABLE"#);
+                        l.push(format!("echo   {cmd}"));
+                        l.push(format!("echo %DATE% %TIME% recuperar religar a mao: {cmd} {log}"));
+                        l.push(format!(r#"echo   schtasks /Query /TN "{tn}" /V /FO LIST"#));
                     }
                 }
                 Passo::ComTrava {
@@ -1407,6 +1618,14 @@ impl Gerador<'_> {
     }
 }
 
+/// Consulta (sem saída) que termina com 0 só se a tarefa existe na raiz da agenda e está
+/// habilitada. Caminho absoluto do PowerShell: não depende do PATH da conta SYSTEM.
+pub(crate) fn consulta_habilitada(tn: &str) -> String {
+    format!(
+        r#""%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "if ((Get-ScheduledTask -TaskPath '\' -TaskName '{tn}' -ErrorAction Stop).Settings.Enabled) {{ exit 0 }} else {{ exit 1 }}""#
+    )
+}
+
 pub(crate) fn script_de(
     m: &Modos,
     c: &Caminhos,
@@ -1419,6 +1638,14 @@ pub(crate) fn script_de(
         if !seguro_para_cmd(v) {
             bail!("nome inválido para o cmd: {v:?}");
         }
+    }
+    // As fixas também vão entre aspas simples na consulta do PowerShell, cujo `-TaskName`
+    // aceita curingas: nada de aspas, crase nem `*?[]`.
+    if let Some(v) = tarefas.fixas.iter().find(|v| v.chars().any(|ch| "'`*?[]$".contains(ch))) {
+        bail!("nome de tarefa inválido para o PowerShell: {v:?}");
+    }
+    if tarefas.fixas.len() != TAREFAS_FIXAS {
+        bail!("esperava {TAREFAS_FIXAS} tarefas fixas, vieram {}", tarefas.fixas.len());
     }
     validar_modos(m)?;
     let exe = format!("{app}.exe");

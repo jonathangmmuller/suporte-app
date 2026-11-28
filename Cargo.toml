@@ -46,6 +46,9 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+# Pontos de parada do atualizador (troca.rs, `ponto_bancada`) para a bancada Windows. Só no
+# build de bancada do workflow (`bancada: true`, que nunca publica); desligada em todo o resto.
+bancada-pausas = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
