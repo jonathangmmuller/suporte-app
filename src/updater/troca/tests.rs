@@ -17,6 +17,9 @@ const T0: Tempos = Tempos {
     subir: 5,
     estavel: 5,
     renomear: 3,
+    // espera do manual (em passos) maior que a execução mais longa do corpo, como os 20 min de
+    // `Tempos::PADRAO` diante do pior caso de ≈ 8 min
+    trava: 200,
 };
 
 fn tmp() -> PathBuf {
@@ -136,8 +139,21 @@ struct Falso {
     quebrado: bool,
     /// pasta de origem → quantas vezes ainda falhar o rename
     falhas_renomear: HashMap<PathBuf, u32>,
-    /// Tarefas da recuperação registradas.
+    /// Tarefas fixas da recuperação registradas (ao iniciar e a cada minuto).
     tarefas: bool,
+    /// As fixas habilitadas (o modo manual desabilita).
+    habilitadas: bool,
+    /// Tarefa `religar` registrada.
+    religar: bool,
+    /// Processos segurando `recuperar.lock` agora (e o máximo visto).
+    donos: u32,
+    max_donos: u32,
+    /// Mutação: a trava não exclui (prova que os testes de disputa enxergam a falta dela).
+    trava_quebrada: bool,
+    /// `rd /s /q` de `.falhou` falha (arquivo preso) e a pasta fica.
+    falhou_presa: bool,
+    /// Operações de agenda que falham: "criar_religar", "desabilitar", "habilitar".
+    falhar_agenda: Vec<&'static str>,
     /// Operações até a "queda de energia" (pânico); `None` = sem queda.
     vida: Option<u32>,
     eventos: Rc<RefCell<Vec<String>>>,
@@ -157,6 +173,13 @@ impl Falso {
             quebrado: false,
             falhas_renomear: HashMap::new(),
             tarefas: true,
+            habilitadas: true,
+            religar: false,
+            donos: 0,
+            max_donos: 0,
+            trava_quebrada: false,
+            falhou_presa: false,
+            falhar_agenda: vec![],
             vida: None,
             eventos: Rc::new(RefCell::new(Vec::new())),
         }
@@ -273,6 +296,58 @@ impl Sistema for Falso {
         self.operacao();
         self.ev("apagar-tarefas");
         self.tarefas = false;
+        self.religar = false;
+    }
+    fn apagar(&mut self, p: &Path) -> io::Result<()> {
+        self.operacao();
+        if self.falhou_presa && p == self.c.falhou && p.exists() {
+            self.ev("rd-preso");
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "arquivo preso"));
+        }
+        remover_arvore(p).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+    fn travar(&mut self) -> bool {
+        self.operacao();
+        if self.donos > 0 && !self.trava_quebrada {
+            self.ev("trava-ocupada");
+            return false;
+        }
+        self.donos += 1;
+        self.max_donos = self.max_donos.max(self.donos);
+        self.ev("travou");
+        true
+    }
+    fn soltar(&mut self) {
+        // fechar o handle (ou o processo morrer) não é uma operação que possa "cair"
+        self.donos -= 1;
+        self.ev("soltou");
+    }
+    fn criar_religar(&mut self) -> bool {
+        self.operacao();
+        if self.falhar_agenda.contains(&"criar_religar") {
+            return false;
+        }
+        self.ev("criar-religar");
+        self.religar = true;
+        true
+    }
+    fn desabilitar_tarefas(&mut self) -> bool {
+        self.operacao();
+        if self.falhar_agenda.contains(&"desabilitar") && self.tarefas {
+            return false;
+        }
+        self.ev("desabilitar");
+        self.habilitadas = false;
+        true
+    }
+    fn habilitar_tarefas(&mut self) -> bool {
+        self.operacao();
+        if self.falhar_agenda.contains(&"habilitar") && self.tarefas {
+            return false;
+        }
+        self.ev("habilitar");
+        self.habilitadas = true;
+        true
     }
 }
 
@@ -720,7 +795,7 @@ fn abrir_com(
 /// Restos de uma atualização anterior (irmãs da instalação e arquivos de `troca`).
 fn plantar_restos(c: &Caminhos, marcadores: &[&str]) -> Vec<PathBuf> {
     let mut v = vec![];
-    for d in [&c.novo, &c.anterior, &c.falhou] {
+    for d in [&c.novo, &c.anterior, &c.falhou, &c.afastada(1), &c.afastada(AFASTADAS)] {
         escrever(&d.join(EXE), "BOM resto");
         v.push(d.join(EXE));
     }
@@ -1236,6 +1311,8 @@ fn recuperacao_exaustiva() {
                 for concluido in [false, true] {
                     for padrao in 0..27usize {
                         let falhas = [padrao % 3, padrao / 3 % 3, padrao / 9].map(|i| [0, 1, 99][i]);
+                        // R5: `.falhou` que o `rd` não apaga (arquivo preso)
+                        for presa in [false, true] {
                         for (inicial, quebrado) in [
                             (Servico::Rodando, false),
                             (Servico::Parado, false),
@@ -1250,6 +1327,7 @@ fn recuperacao_exaustiva() {
                             assert_eq!(s.estado, if atual_sobe { Servico::Rodando } else { Servico::Parado });
                             s.estado = inicial;
                             s.quebrado = quebrado;
+                            s.falhou_presa = presa;
                             for (p, n) in Pasta::TODAS.iter().zip(falhas) {
                                 if n > 0 {
                                     s.falhas_renomear.insert(m.c.pasta(*p).to_owned(), n);
@@ -1260,7 +1338,7 @@ fn recuperacao_exaustiva() {
                             let motivos = motivos_pendente(estado, concluido, falhas, quebrado);
                             let ctx = format!(
                                 "{estado:?} concluido={concluido} falhas={falhas:?} {inicial:?} \
-                                 quebrado={quebrado} -> {saida:?} {motivos:?} {:?}",
+                                 quebrado={quebrado} presa={presa} -> {saida:?} {motivos:?} {:?}",
                                 s.eventos()
                             );
                             match saida {
@@ -1272,6 +1350,7 @@ fn recuperacao_exaustiva() {
                                     assert!(m.c.concluido().is_file(), "{ctx}");
                                     assert!(!s.tarefas, "{ctx}");
                                 }
+                                Saida::Ocupada => unreachable!("corpo não sai ocupado"),
                                 Saida::Pendente => {
                                     assert!(!motivos.is_empty(), "pendente sem motivo conhecido: {ctx}");
                                     for x in &motivos {
@@ -1292,15 +1371,20 @@ fn recuperacao_exaustiva() {
                             if concluido && a.is_some() {
                                 assert!(!s.eventos().iter().any(|e| e.starts_with("ren:")), "{ctx}");
                             }
+                            if presa && f.is_some() && saida == Saida::Concluida && b.is_some() {
+                                // a `.falhou` presa saiu do caminho (afastada) em vez de travar
+                                assert!(!s.eventos().iter().any(|e| e == "ren-destino-existe"), "{ctx}");
+                            }
+                        }
                         }
                     }
                 }
             }
         }
     }
-    // 63 estados × 2 (concluido) × 27 (falhas) × (parado + quebrado) + 32 estados com a atual
-    // que sobe × 2 × 27 rodando
-    assert_eq!(casos, 63 * 2 * 27 * 2 + 32 * 2 * 27);
+    // (63 estados × 2 (concluido) × 27 (falhas) × (parado + quebrado) + 32 estados com a atual
+    // que sobe × 2 × 27 rodando) × 2 (`.falhou` presa ou não)
+    assert_eq!(casos, (63 * 2 * 27 * 2 + 32 * 2 * 27) * 2);
     assert!(concluidas > 0 && concluidas < casos);
     eprintln!("recuperacao_exaustiva: {casos} casos, {concluidas} concluídas, pendentes por motivo {por_motivo:?}");
 }
@@ -1438,16 +1522,35 @@ const TAREFAS: [&str; 2] = [
     "SuporteVancin-recuperar-atualizacao",
     "SuporteVancin-recuperar-atualizacao-minuto",
 ];
+const RELIGAR: &str = "SuporteVancin-recuperar-atualizacao-religar";
+const TF: Tarefas = Tarefas {
+    fixas: &TAREFAS,
+    religar: RELIGAR,
+};
+const TC: Tarefas = Tarefas {
+    fixas: &["C"],
+    religar: "R",
+};
 
 fn bat() -> String {
     script_recuperar(
         &caminhos_windows(),
         "SuporteVancin",
         "RuntimeBroker_rustdesk.exe",
-        &TAREFAS,
+        &TF,
         &Tempos::PADRAO,
     )
     .unwrap()
+}
+
+/// Linhas de `:inicio` até o próximo rótulo de modo (`:manual`, `:religar`, `:principal`).
+fn secao<'a>(ls: &[&'a str], inicio: &str) -> Vec<&'a str> {
+    let i = ls.iter().position(|l| *l == inicio).unwrap_or_else(|| panic!("sem {inicio}"));
+    ls[i + 1..]
+        .iter()
+        .take_while(|l| ![":manual", ":religar", ":principal", ":ren"].contains(*l))
+        .copied()
+        .collect()
 }
 
 fn linhas(s: &str) -> Vec<&str> {
@@ -1479,9 +1582,11 @@ fn bat_todo_goto_tem_rotulo_e_todo_rotulo_do_programa_existe() {
             assert!(rotulos.contains(&alvo), "call sem rótulo: {l}");
         }
     }
-    for p in programa_recuperar() {
+    let m = Modos::padrao();
+    validar_modos(&m).unwrap();
+    for p in m.automatico.iter().chain(&m.manual).chain(&m.religar).chain(&m.corpo) {
         if let Passo::Rotulo(r) = p {
-            assert!(rotulos.contains(&r), "{r}");
+            assert!(rotulos.contains(r), "{r}");
         }
     }
     assert!(!ls.iter().any(|l| l.trim_start().starts_with("move ")));
@@ -1489,22 +1594,100 @@ fn bat_todo_goto_tem_rotulo_e_todo_rotulo_do_programa_existe() {
     assert!(b.contains(r#"set "TROCA=C:/ProgramData/SuporteVancin/atualizacao""#));
 }
 
-/// Recuperação serializada: o corpo só roda com o descritor 9 em `recuperar.lock`; sem a
-/// trava, sai com 3 sem tocar em nada. `:principal` não é alcançável por queda.
+/// Recuperação serializada: o corpo só roda com o descritor 9 em `recuperar.lock`, em todos
+/// os modos; sem a trava, `SAIDA` continua 3 e nada é tocado. `:principal` não é alcançável
+/// por queda; fora dele nada mexe em serviço, pasta, processo ou apaga tarefa.
 #[test]
 fn bat_corpo_so_roda_com_a_trava() {
     let b = bat();
     let ls = linhas(&b);
-    let chama = linha(&b, r#"call :principal 9>"%TROCA%\recuperar.lock""#);
-    let sai = linha(&b, "exit /b %SAIDA%");
     let corpo = ls.iter().position(|l| *l == ":principal").unwrap();
-    assert!(linha(&b, r#"set "SAIDA=3""#) < chama && chama < sai && sai + 1 == corpo);
-    // nada antes da trava mexe em serviço, pasta ou tarefa
+    let chamadas: Vec<usize> = (0..ls.len()).filter(|i| ls[*i].contains(":principal")).collect();
+    // automático, manual e religar: uma chamada cada (+ o rótulo)
+    assert_eq!(chamadas.len(), 4, "{chamadas:?}");
+    for i in chamadas.iter().filter(|i| **i != corpo) {
+        assert_eq!(ls[*i], r#"call :principal 9>"%TROCA%\recuperar.lock""#);
+        assert_eq!(ls[i - 1], r#"set "SAIDA=3""#);
+        assert_eq!(ls[i + 1], r#"if "%SAIDA%"=="0" goto "#.to_owned() + ls[i + 1].rsplit(' ').next().unwrap());
+        assert!(ls[i + 2].starts_with(r#"if "%SAIDA%"=="1" goto "#), "{}", ls[i + 2]);
+    }
+    assert!(ls[corpo - 1].starts_with("exit /b "), "queda para dentro de :principal");
     for l in &ls[..corpo] {
-        for proibido in ["sc ", "ren ", "rd ", "schtasks", "taskkill"] {
+        for proibido in ["sc ", "ren ", "rd ", "taskkill", "schtasks /Delete", "echo ok>"] {
             assert!(!l.contains(proibido), "{l}");
         }
     }
+    // modo desconhecido não roda nada
+    let desp = linha(&b, r#"if not "%~1"=="" exit /b 2"#);
+    assert_eq!(ls[desp - 2], r#"if /i "%~1"=="manual" goto manual"#);
+    assert_eq!(ls[desp - 1], r#"if /i "%~1"=="religar" goto religar"#);
+    // automático: trava ocupada = log e sai com 3
+    let auto = secao(&ls, r#"if not "%~1"=="" exit /b 2"#);
+    assert_eq!(auto[4], "goto auto_ocupado");
+    let oc = auto.iter().position(|l| *l == ":auto_ocupado").unwrap();
+    assert!(auto[oc + 1].contains("recuperar ocupado"));
+    assert_eq!(auto[oc + 2], "exit /b 3");
+}
+
+/// R5, achado 1: o modo manual (1) registra `religar`, (2) desabilita as duas tarefas, (3) só
+/// então pega a trava (esperando), (4) não apaga tarefa nem mexe em pasta/serviço fora do
+/// corpo e (5) reabilita as tarefas em todo caminho que não seja `Concluida`.
+#[test]
+fn bat_manual_desabilita_espera_a_trava_e_reabilita_na_falha() {
+    let b = bat();
+    let ls = linhas(&b);
+    let m = secao(&ls, ":manual");
+    let pos = |t: &str| {
+        m.iter()
+            .position(|l| l.contains(t))
+            .unwrap_or_else(|| panic!("manual sem {t}:\n{}", m.join("\n")))
+    };
+    let criar = pos("schtasks /Create");
+    assert_eq!(
+        m[criar],
+        format!(
+            r#"schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC ONSTART /TN "{RELIGAR}" /TR "\"%TROCA%\recuperar.bat\" religar" >nul 2>&1 || goto manual_sem_religar"#
+        )
+    );
+    let mut desab = vec![];
+    for tn in TAREFAS {
+        let d = pos(&format!(r#"schtasks /Change /TN "{tn}" /DISABLE"#));
+        let rot = m[d].rsplit(' ').next().unwrap();
+        // não desabilitou: só segue se a tarefa não existe mais
+        assert_eq!(m[d + 1], format!(r#"schtasks /Query /TN "{tn}" >nul 2>&1 && goto manual_reabilitar"#));
+        assert_eq!(m[d + 2], format!(":{rot}"));
+        desab.push(d);
+    }
+    let chama = pos("call :principal");
+    assert!(criar < desab[0] && desab[0] < desab[1] && desab[1] < chama);
+    // espera a trava (400 × 3 s) e desiste reabilitando
+    assert_eq!(m[chama + 1], r#"if "%SAIDA%"=="0" goto manual_ok"#);
+    assert_eq!(m[chama + 2], r#"if "%SAIDA%"=="1" goto manual_reabilitar"#);
+    assert_eq!(m[chama + 3], "if %T% GEQ 400 goto manual_reabilitar");
+    assert_eq!(m[chama - 2], m[chama + 6].replace("goto ", ":"), "laço da espera");
+    // fora do corpo: nada de apagar tarefa, nem serviço/pasta
+    for l in &m {
+        for proibido in ["schtasks /Delete", "sc ", "ren ", "rd ", "taskkill", "/ENABLE >nul 2>&1 && goto manual_ok"] {
+            assert!(!l.contains(proibido), "{l}");
+        }
+    }
+    // todo caminho que não é `Concluida` passa pela reabilitação antes de sair
+    let reab = pos(":manual_reabilitar");
+    for (j, tn) in TAREFAS.iter().enumerate() {
+        assert!(m[reab + 1 + 3 * j].starts_with(&format!(r#"schtasks /Change /TN "{tn}" /ENABLE"#)));
+    }
+    let ok = pos(":manual_ok");
+    assert!(m[ok..reab].iter().any(|l| *l == "exit /b 0"));
+    assert!(m[reab..].iter().any(|l| *l == "exit /b 1"));
+    // `manual_ok` só vem do corpo `Concluida` (SAIDA=0)
+    let para_ok: Vec<&&str> = ls.iter().filter(|l| l.ends_with("goto manual_ok")).collect();
+    assert_eq!(para_ok, vec![&r#"if "%SAIDA%"=="0" goto manual_ok"#]);
+    // religar: reabilita antes de pegar a trava
+    let r = secao(&ls, ":religar");
+    let en = r.iter().position(|l| l.contains("/ENABLE")).unwrap();
+    let ch = r.iter().position(|l| l.contains("call :principal")).unwrap();
+    assert!(en < ch);
+    assert_eq!(r[ch + 3], "goto religar_ocupado");
 }
 
 /// `schtasks /Delete` e `concluido` só são alcançáveis passando pela confirmação de RUNNING
@@ -1520,7 +1703,7 @@ fn bat_so_apaga_tarefas_e_conclui_depois_de_running_estavel() {
         .filter(|(_, l)| l.contains("schtasks /Delete") || l.contains("echo ok>"))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(alvos.len(), 3, "2 tarefas + concluido");
+    assert_eq!(alvos.len(), 4, "2 tarefas fixas + religar + concluido");
     for i in alvos {
         let r = (0..i).rev().find(|j| ls[*j].starts_with(':')).unwrap();
         let rot = &ls[r][1..];
@@ -1557,7 +1740,7 @@ fn bat_cada_ren_confere_resultado_e_destino() {
     let ren: Vec<usize> = (0..ls.len()).filter(|i| ls[*i].starts_with("call :ren ")).collect();
     let n = programa_recuperar()
         .iter()
-        .filter(|p| matches!(p, Passo::Renomear { .. }))
+        .filter(|p| matches!(p, Passo::Renomear { .. } | Passo::Afastar { .. }))
         .count();
     assert_eq!(ren.len(), n);
     for i in ren {
@@ -1585,9 +1768,11 @@ fn bat_segue_os_tempos() {
         subir: 8,
         estavel: 9,
         renomear: 4,
+        trava: 11,
     };
-    let b = script_recuperar(&caminhos_windows(), "A", "B", &["T"], &t).unwrap();
+    let b = script_recuperar(&caminhos_windows(), "A", "B", &TC, &t).unwrap();
     for trecho in [
+        "if %T% GEQ 11 goto manual_reabilitar",
         "if %N% GEQ 7 goto",
         "if %N% GEQ 8 goto pendente",
         "if %N% GEQ 9 goto",
@@ -1615,12 +1800,375 @@ fn script_guarda_espera_o_processo_antes_de_recuperar() {
 fn scripts_recusam_caracteres_do_cmd() {
     for ruim in ["C:/A%B/X", "C:/A&B/X", "C:/A!B/X", "C:/A\"B/X", "C:/A^B/X"] {
         let c = Caminhos::de(Path::new(ruim), Path::new("C:/PD/x"));
-        assert!(script_recuperar(&c, "A", "B", &["C"], &T0).is_err(), "{ruim}");
+        assert!(script_recuperar(&c, "A", "B", &TC, &T0).is_err(), "{ruim}");
         let c = Caminhos::de(Path::new("C:/ok"), Path::new(ruim));
         assert!(script_guarda(&c, 1, 1).is_err(), "{ruim}");
-        assert!(script_recuperar(&c, "A", "B", &["C"], &T0).is_err(), "{ruim}");
+        assert!(script_recuperar(&c, "A", "B", &TC, &T0).is_err(), "{ruim}");
     }
     let c = caminhos_windows();
-    assert!(script_recuperar(&c, "A&B", "B", &["C"], &T0).is_err());
-    assert!(script_recuperar(&c, "A", "B", &["C|D"], &T0).is_err());
+    assert!(script_recuperar(&c, "A&B", "B", &TC, &T0).is_err());
+    let ruim = Tarefas { fixas: &["C|D"], religar: "R" };
+    assert!(script_recuperar(&c, "A", "B", &ruim, &T0).is_err());
+    let ruim = Tarefas { fixas: &["C"], religar: "R&S" };
+    assert!(script_recuperar(&c, "A", "B", &ruim, &T0).is_err());
+}
+
+// ------------------------------------------------------------------------------------
+// R5, achado 1: recuperação manual (`recuperar.bat manual`) disputando com a guarda e com as
+// tarefas, `.falhou` pré-existente e queda em cada passo.
+// ------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ator {
+    Manual,
+    Minuto,
+    Guarda,
+}
+
+#[derive(Default, Debug)]
+struct Disputa {
+    saidas: Vec<(String, Saida)>,
+    /// O manual tentou a trava e a achou ocupada (esperou outra execução terminar).
+    manual_esperou: bool,
+    /// Uma execução automática achou a trava ocupada pelo manual (saiu com 3).
+    auto_barrada: bool,
+}
+
+/// Escalonador: a tarefa de minuto já está rodando no passo 0; o técnico roda o manual no
+/// passo `d_manual`; a guarda entra no passo `d_guarda`; a tarefa de minuto dispara a cada
+/// `cada` passos se existe e está habilitada (uma instância por vez, como no Agendador); cada
+/// ator roda `q` passos por vez. Erro = invariante violada (sem pânico, para a prova de
+/// mutação).
+fn disputar(
+    m: &Mini,
+    s: &mut Falso,
+    d_manual: usize,
+    d_guarda: Option<usize>,
+    cada: usize,
+    q: usize,
+) -> Result<Disputa, String> {
+    let corpo = programa_recuperar();
+    let (auto, manual) = (programa_automatico(), programa_manual());
+    let mut atores: Vec<(Ator, Exec)> = vec![(Ator::Minuto, Exec::novo(&auto, &corpo))];
+    let (mut lancou_manual, mut lancou_guarda) = (false, d_guarda.is_none());
+    let mut d = Disputa::default();
+    let (mut passo, mut vez) = (0usize, 0usize);
+    loop {
+        if !lancou_manual && passo >= d_manual {
+            atores.push((Ator::Manual, Exec::novo(&manual, &corpo)));
+            lancou_manual = true;
+        }
+        if !lancou_guarda && passo >= d_guarda.unwrap() {
+            atores.push((Ator::Guarda, Exec::novo(&auto, &corpo)));
+            lancou_guarda = true;
+        }
+        if passo > 0
+            && passo % cada == 0
+            && s.tarefas
+            && s.habilitadas
+            && !atores.iter().any(|a| a.0 == Ator::Minuto)
+        {
+            atores.push((Ator::Minuto, Exec::novo(&auto, &corpo)));
+        }
+        if atores.is_empty() {
+            if lancou_manual && lancou_guarda {
+                break;
+            }
+            passo += 1;
+            continue;
+        }
+        if passo > 50_000 {
+            return Err("não terminou".into());
+        }
+        vez %= atores.len();
+        let mut fim = None;
+        for _ in 0..q {
+            let manual_dentro = atores.iter().any(|a| a.0 == Ator::Manual && a.1.no_corpo());
+            let antes = s.eventos.borrow().len();
+            let (quem, e) = &mut atores[vez];
+            let (i, p, x) = e.avancar(&m.c, EXE, s, &T0);
+            passo += 1;
+            let ocupada = s.eventos.borrow()[antes..].iter().any(|e| e == "trava-ocupada");
+            if ocupada && *quem == Ator::Manual {
+                d.manual_esperou = true;
+            }
+            if ocupada && *quem != Ator::Manual && manual_dentro {
+                d.auto_barrada = true;
+            }
+            if s.donos > 1 {
+                return Err(format!("dois corpos ao mesmo tempo ({quem:?} passo {i} {p:?})"));
+            }
+            if !alguma_utilizavel(&m.c) {
+                return Err(format!("sem instalação utilizável ({quem:?} passo {i} {p:?})"));
+            }
+            if let Some(x) = x {
+                fim = Some(x);
+                break;
+            }
+        }
+        if let Some(x) = fim {
+            let (quem, _) = atores.remove(vez);
+            d.saidas.push((format!("{quem:?}"), x));
+        } else {
+            vez += 1;
+        }
+    }
+    if s.donos != 0 {
+        return Err("trava não solta".into());
+    }
+    Ok(d)
+}
+
+/// Estados de troca interrompida em que a recuperação tem como concluir (sem `motivos`).
+const INTERROMPIDAS: [[Option<&str>; 3]; 4] = [
+    [Some("RUIM"), Some("BOM"), None],
+    [None, Some("BOM"), None],
+    [Some("CAI"), Some("BOM"), Some("RUIM")],
+    [Some("RUIM"), Some("BOM"), Some("BOM")],
+];
+
+/// Manual × tarefa de minuto × guarda, em todo deslocamento de início do manual e em vários
+/// quanta: nunca dois corpos ao mesmo tempo; a invariante vale em todo passo; o manual termina
+/// `Concluida` (esperando a execução em curso quando preciso); nenhuma automática fica
+/// `Pendente`; ao fim, caminho ativo utilizável, `concluido`, tarefas e `religar` apagadas.
+#[test]
+fn manual_disputa_com_tarefa_de_minuto_e_guarda() {
+    let (mut casos, mut esperou, mut barrada) = (0, 0, 0);
+    for estado in INTERROMPIDAS {
+        assert!(motivos_pendente(estado, false, [0; 3], false).is_empty());
+        for d_manual in 0..36 {
+            for d_guarda in [None, Some(0), Some(7), Some(23)] {
+                for cada in [3, 8] {
+                    for q in [1, 2, 5] {
+                        casos += 1;
+                        let m = Mini::novo(estado, false);
+                        let mut s = Falso::novo(&m.c);
+                        let ctx = format!("{estado:?} manual@{d_manual} guarda@{d_guarda:?} cada={cada} q={q}");
+                        let d = disputar(&m, &mut s, d_manual, d_guarda, cada, q)
+                            .unwrap_or_else(|e| panic!("{e}: {ctx} {:?}", s.eventos()));
+                        let ctx = format!("{ctx} {:?} {:?}", d.saidas, s.eventos());
+                        let manual: Vec<_> = d.saidas.iter().filter(|x| x.0 == "Manual").collect();
+                        assert_eq!(manual, vec![&("Manual".to_owned(), Saida::Concluida)], "{ctx}");
+                        assert!(!d.saidas.iter().any(|x| x.1 == Saida::Pendente), "{ctx}");
+                        ativo_utilizavel(&m.c, &s).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+                        assert!(m.c.concluido().is_file(), "{ctx}");
+                        assert!(!s.tarefas && !s.religar, "{ctx}");
+                        esperou += d.manual_esperou as u32;
+                        barrada += d.auto_barrada as u32;
+                    }
+                }
+            }
+        }
+    }
+    // os dois lados da disputa aconteceram de fato
+    assert!(esperou > 0 && barrada > 0, "esperou={esperou} barrada={barrada}");
+    eprintln!("manual_disputa: {casos} casos, manual esperou em {esperou}, automática barrada em {barrada}");
+}
+
+/// Prova de mutação: com a trava sem efeito, o mesmo escalonador acha dois corpos ao mesmo
+/// tempo (o teste acima enxergaria a falta da trava).
+#[test]
+fn manual_sem_trava_e_detectado() {
+    let mut detectados = 0;
+    let mut casos = 0;
+    for estado in INTERROMPIDAS {
+        for d_manual in 0..12 {
+            casos += 1;
+            let m = Mini::novo(estado, false);
+            let mut s = Falso::novo(&m.c);
+            s.trava_quebrada = true;
+            if let Err(e) = disputar(&m, &mut s, d_manual, Some(0), 3, 1) {
+                assert!(e.starts_with("dois corpos"), "{e}");
+                detectados += 1;
+            }
+        }
+    }
+    assert!(detectados * 2 > casos, "{detectados}/{casos}");
+}
+
+fn manual(m: &Mini, s: &mut Falso) -> Saida {
+    executar(&programa_manual(), &m.c, EXE, s, &T0, &mut |i, p| {
+        assert!(alguma_utilizavel(&m.c), "passo {i} ({p:?}) deixou sem instalação utilizável");
+    })
+}
+
+/// `.falhou` pré-existente que o `rd` não apaga (arquivo preso): a tabela não trava no
+/// destino existente; afasta para o primeiro `.falhou.<n>` livre e conclui. Sem nome livre ou
+/// com o `ren` dela bloqueado: `Pendente`, nada perdido, tarefas reabilitadas.
+#[test]
+fn falhou_preexistente_presa_e_afastada() {
+    for ocupadas in [0, 1, 4, AFASTADAS] {
+        let m = Mini::novo([Some("RUIM"), Some("BOM"), Some("RUIM")], false);
+        for n in 1..=ocupadas {
+            escrever(&m.c.afastada(n).join(EXE), &format!("RUIM antiga {n}"));
+        }
+        let mut s = Falso::novo(&m.c);
+        s.falhou_presa = true;
+        let saida = manual(&m, &mut s);
+        let ctx = format!("ocupadas={ocupadas} {saida:?} {:?}", s.eventos());
+        assert!(s.eventos().contains(&"rd-preso".to_owned()), "{ctx}");
+        assert!(!s.eventos().contains(&"ren-destino-existe".to_owned()), "{ctx}");
+        if ocupadas < AFASTADAS {
+            assert_eq!(saida, Saida::Concluida, "{ctx}");
+            ativo_utilizavel(&m.c, &s).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+            assert_eq!(ler(&m.c.atual.join(EXE)), "BOM Anterior", "{ctx}");
+            assert_eq!(ler(&m.c.afastada(ocupadas + 1).join(EXE)), "RUIM Falhou", "{ctx}");
+            assert_eq!(ler(&m.c.falhou.join(EXE)), "RUIM Atual", "{ctx}");
+            assert!(!s.tarefas && !s.religar, "{ctx}");
+        } else {
+            assert_eq!(saida, Saida::Pendente, "{ctx}");
+            assert_eq!(ler(&m.c.anterior.join(EXE)), "BOM Anterior", "{ctx}");
+            assert!(s.tarefas && s.habilitadas && !m.c.concluido().exists(), "{ctx}");
+        }
+        for n in 1..=ocupadas {
+            assert_eq!(ler(&m.c.afastada(n).join(EXE)), format!("RUIM antiga {n}"), "{ctx}");
+        }
+    }
+    // presa e com `ren` bloqueado: não sobrescreve nada, fica pendente com as tarefas ativas
+    let m = Mini::novo([Some("RUIM"), Some("BOM"), Some("RUIM")], false);
+    let mut s = Falso::novo(&m.c);
+    s.falhou_presa = true;
+    s.falhas_renomear.insert(m.c.falhou.clone(), 99);
+    assert_eq!(manual(&m, &mut s), Saida::Pendente);
+    assert_eq!(ler(&m.c.anterior.join(EXE)), "BOM Anterior");
+    assert_eq!(ler(&m.c.falhou.join(EXE)), "RUIM Falhou");
+    assert!(s.tarefas && s.habilitadas);
+}
+
+/// Falhas do manual fora do corpo: sem `religar` não mexe em nada; não desabilitou, trava que
+/// não vem ou corpo pendente = tarefas reabilitadas (a automática retoma) e `Pendente`.
+#[test]
+fn manual_que_falha_reabilita_as_tarefas() {
+    let estado = [Some("RUIM"), Some("BOM"), None];
+    let pastas = |m: &Mini| Pasta::TODAS.map(|p| ler(&m.c.pasta(p).join(EXE)));
+    for caso in ["criar_religar", "desabilitar", "trava_presa", "corpo_pendente"] {
+        let m = Mini::novo(estado, false);
+        let antes = pastas(&m);
+        let mut s = Falso::novo(&m.c);
+        match caso {
+            "criar_religar" | "desabilitar" => s.falhar_agenda.push(caso),
+            "trava_presa" => s.donos = 1, // outra execução segura a trava o tempo todo
+            _ => s.quebrado = true,
+        }
+        let saida = manual(&m, &mut s);
+        let ev = s.eventos();
+        let ctx = format!("{caso}: {saida:?} {ev:?}");
+        assert_eq!(saida, Saida::Pendente, "{ctx}");
+        assert!(s.tarefas && s.habilitadas, "{ctx}");
+        assert!(!m.c.concluido().exists(), "{ctx}");
+        match caso {
+            "criar_religar" => {
+                assert!(!s.religar && !ev.iter().any(|e| e == "desabilitar" || e == "habilitar"), "{ctx}");
+            }
+            "trava_presa" => {
+                let n = ev.iter().filter(|e| *e == "trava-ocupada").count() as u32;
+                assert_eq!(n, T0.trava + 1, "{ctx}");
+            }
+            _ => {}
+        }
+        if caso != "corpo_pendente" {
+            assert_eq!(pastas(&m), antes, "{ctx}");
+            assert!(!ev.iter().any(|e| e == "parar" || e.starts_with("ren")), "{ctx}");
+        }
+        if caso != "criar_religar" {
+            // `habilitar` depois de `desabilitar` (quando houve)
+            let h = ev.iter().rposition(|e| e == "habilitar").expect("reabilitou");
+            assert!(ev.iter().position(|e| e == "desabilitar").map_or(true, |d| d < h), "{ctx}");
+        }
+    }
+}
+
+/// Queda de energia (ou janela fechada) em cada operação do manual. Depois do boot: a
+/// `religar` (se registrada) reabilita as tarefas, a do boot e a de minuto rodam o automático;
+/// sem tarefa nenhuma, o SCM sobe o serviço (início automático). Sem boot: o técnico roda o
+/// manual de novo. Em todos: caminho ativo utilizável, `concluido`, tarefas e `religar`
+/// apagadas; a invariante vale em todo passo.
+#[test]
+fn queda_em_cada_passo_da_recuperacao_manual() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let corpo = programa_recuperar();
+    let _ = corpo;
+    for estado in INTERROMPIDAS {
+        let total = {
+            let m = Mini::novo(estado, false);
+            let mut s = Falso::novo(&m.c);
+            s.vida = Some(u32::MAX);
+            assert_eq!(manual(&m, &mut s), Saida::Concluida);
+            u32::MAX - s.vida.unwrap()
+        };
+        for k in 0..total {
+            for reboot in [true, false] {
+                let m = Mini::novo(estado, false);
+                let mut s = Falso::novo(&m.c);
+                s.vida = Some(k);
+                let caiu = queda(catch_unwind(AssertUnwindSafe(|| manual(&m, &mut s))));
+                assert!(caiu, "{estado:?} k={k}");
+                assert!(alguma_utilizavel(&m.c), "{estado:?} k={k}");
+                let ctx = format!(
+                    "{estado:?} k={k}/{total} reboot={reboot} tarefas={} habilitadas={} religar={}",
+                    s.tarefas, s.habilitadas, s.religar
+                );
+                if reboot {
+                    let mut s2 = Falso::novo(&m.c);
+                    s2.estado = Servico::Parado;
+                    (s2.tarefas, s2.habilitadas, s2.religar) = (s.tarefas, s.habilitadas, s.religar);
+                    let mut saidas = vec![];
+                    let mut roda = |prog: Vec<Passo>, s2: &mut Falso| {
+                        let x = executar(&prog, &m.c, EXE, s2, &T0, &mut |i, p| {
+                            assert!(alguma_utilizavel(&m.c), "passo {i} {p:?}");
+                        });
+                        saidas.push(x);
+                    };
+                    if s2.religar {
+                        roda(programa_religar(), &mut s2);
+                    }
+                    for _ in 0..3 {
+                        // ao iniciar e depois a de minuto
+                        if s2.tarefas && s2.habilitadas {
+                            roda(programa_automatico(), &mut s2);
+                        }
+                    }
+                    if !s2.tarefas && !s2.religar && s2.estado != Servico::Rodando {
+                        s2.iniciar_servico(); // SCM: serviço com início automático
+                    }
+                    let ctx = format!("{ctx} {saidas:?} {:?}", s2.eventos());
+                    ativo_utilizavel(&m.c, &s2).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+                    assert!(m.c.concluido().is_file(), "{ctx}");
+                    assert!(!s2.tarefas && !s2.religar, "{ctx}");
+                } else {
+                    // o processo morreu: a trava sai com ele; o técnico roda de novo
+                    s.vida = None;
+                    s.donos = 0;
+                    let saida = manual(&m, &mut s);
+                    let ctx = format!("{ctx} {saida:?} {:?}", s.eventos());
+                    assert_eq!(saida, Saida::Concluida, "{ctx}");
+                    ativo_utilizavel(&m.c, &s).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+                    assert!(!s.tarefas && !s.religar, "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn modos_invalidos_sao_recusados() {
+    use Passo::*;
+    validar_modos(&Modos::padrao()).unwrap();
+    // corpo não pode mexer na agenda nem pegar a trava de novo
+    let mut m = Modos::padrao();
+    m.corpo.insert(0, HabilitarTarefas);
+    assert!(validar_modos(&m).is_err());
+    // modo não pode mexer em pasta/serviço fora da trava
+    for p in [PararServico, Apagar(Pasta::Falhou), ApagarTarefas, SubirEstavel { falha: "manual_ok" }] {
+        let mut m = Modos::padrao();
+        m.manual.insert(0, p);
+        assert!(validar_modos(&m).is_err(), "{p:?}");
+    }
+    // rótulo repetido entre programas / reservado
+    let mut m = Modos::padrao();
+    m.manual.insert(0, Rotulo("garantir"));
+    assert!(validar_modos(&m).is_err());
+    let mut m = Modos::padrao();
+    m.manual.insert(0, Rotulo("principal"));
+    assert!(validar_modos(&m).is_err());
 }

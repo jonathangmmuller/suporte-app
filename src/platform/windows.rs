@@ -3788,7 +3788,10 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     .esperado();
     let tarefa = format!("{app_name}-recuperar-atualizacao");
     let tarefa_minuto = format!("{tarefa}-minuto");
-    let tarefas = [tarefa.as_str(), tarefa_minuto.as_str()];
+    // `religar`: só o `recuperar.bat manual` cria (R5); sai com as outras.
+    let tarefa_religar = format!("{tarefa}-religar");
+    let fixas = [tarefa.as_str(), tarefa_minuto.as_str()];
+    let tarefas = [tarefa.as_str(), tarefa_minuto.as_str(), tarefa_religar.as_str()];
     let schtasks = |args: &[&str]| {
         std::process::Command::new("schtasks")
             .args(args)
@@ -3867,7 +3870,10 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         &c,
         &app_name,
         win_topmost_window::INJECTED_PROCESS_EXE,
-        &tarefas,
+        &troca::Tarefas {
+            fixas: &fixas,
+            religar: &tarefa_religar,
+        },
         &Tempos::PADRAO,
     )?;
     let texto_guarda = troca::script_guarda(&c, std::process::id(), 240)?;

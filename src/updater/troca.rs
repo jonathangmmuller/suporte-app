@@ -46,6 +46,11 @@
 //!    dois consumidores: `executar` (interpretador sobre `Sistema` e pastas reais, usado nos
 //!    testes) e `script_recuperar` (gera o BAT, passo a passo). Os testes exercitam a lógica
 //!    que vira BAT, e não o texto dele.
+//! 6. R5: o mesmo `recuperar.bat` tem três modos, todos gerados de programas (`Passo`) e
+//!    interpretados nos testes: sem argumento (guarda e tarefas: pega a trava ou sai com 3),
+//!    `manual` (técnico: registra a tarefa `religar`, desabilita as duas tarefas, ESPERA a trava
+//!    e roda o mesmo corpo; falha = reabilita as tarefas) e `religar` (boot depois de uma
+//!    recuperação manual interrompida: reabilita as tarefas e roda o automático).
 
 pub(crate) mod acl;
 
@@ -64,6 +69,8 @@ pub(crate) const SCRIPT_RECUPERAR: &str = "recuperar.bat";
 pub(crate) const SCRIPT_GUARDA: &str = "guarda.bat";
 /// Gravado com a recuperação já registrada, logo antes de parar o serviço (R4, achado 2).
 pub(crate) const MARCADOR_INICIADA: &str = "iniciada";
+/// Nomes `<inst>.falhou.1..=AFASTADAS` para um `.falhou` que não pôde ser apagado (R5).
+pub(crate) const AFASTADAS: u32 = 9;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caminhos {
@@ -102,6 +109,13 @@ impl Caminhos {
             Pasta::Anterior => &self.anterior,
             Pasta::Falhou => &self.falhou,
         }
+    }
+
+    /// `<inst>.falhou.<n>`: para onde `Afastar` move um `.falhou` que não pôde ser apagado.
+    pub fn afastada(&self, n: u32) -> PathBuf {
+        let mut s = self.falhou.as_os_str().to_owned();
+        s.push(format!(".{n}"));
+        PathBuf::from(s)
     }
 
     pub fn iniciada(&self) -> PathBuf {
@@ -228,7 +242,8 @@ pub(crate) fn abrir_troca<T>(c: &Caminhos, exe: &str, a: &mut Abrir<T>) -> Resul
         remover_arquivo(&c.troca.join(nome))?;
     }
     let atual_ok = c.atual.join(exe).is_file();
-    for d in [&c.novo, &c.anterior, &c.falhou] {
+    let afastadas: Vec<PathBuf> = (1..=AFASTADAS).map(|n| c.afastada(n)).collect();
+    for d in [&c.novo, &c.anterior, &c.falhou].into_iter().chain(&afastadas) {
         if !existe(d)? {
             continue;
         }
@@ -414,8 +429,35 @@ pub(crate) trait Sistema {
     /// Falha se `para` existir (como o `ren` do cmd).
     fn renomear(&mut self, de: &Path, para: &Path) -> io::Result<()>;
     fn esperar(&mut self, d: Duration);
-    /// Apaga as tarefas agendadas da recuperação.
+    /// Apaga as tarefas agendadas da recuperação (as duas fixas e a `religar`).
     fn apagar_tarefas(&mut self);
+    /// `rd /s /q`: pode falhar e deixar a pasta (arquivo preso por outro processo).
+    fn apagar(&mut self, p: &Path) -> io::Result<()> {
+        remover_arvore(p).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    // Só os modos do `recuperar.bat` (fora da trava) usam os métodos abaixo. No Windows quem
+    // os executa é o próprio BAT (`schtasks`, descritor 9); `SistemaWindows` não interpreta
+    // programas, então o padrão recusa (o programa termina `Pendente` sem mexer em nada).
+
+    /// Pega a trava `recuperar.lock` (a mesma da troca e de toda execução do BAT); `false` =
+    /// ocupada.
+    fn travar(&mut self) -> bool {
+        false
+    }
+    fn soltar(&mut self) {}
+    /// Registra a tarefa `religar` (ao iniciar: reabilita as fixas e roda o automático).
+    fn criar_religar(&mut self) -> bool {
+        false
+    }
+    /// Desabilita as tarefas fixas que existem; `false` = alguma existe e não desabilitou.
+    fn desabilitar_tarefas(&mut self) -> bool {
+        false
+    }
+    /// Reabilita as tarefas fixas que existem; `false` = alguma ficou desabilitada.
+    fn habilitar_tarefas(&mut self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -429,6 +471,9 @@ pub(crate) struct Tempos {
     pub estavel: u32,
     /// Tentativas de renomear uma pasta (antivírus/indexador seguram arquivos por instantes).
     pub renomear: u32,
+    /// Modo `manual`: novas tentativas (uma a cada 3 `passo`s) de pegar a trava enquanto
+    /// outra execução (guarda, tarefa, troca) a segura.
+    pub trava: u32,
 }
 
 impl Tempos {
@@ -439,6 +484,8 @@ impl Tempos {
         subir: 60,
         estavel: 20,
         renomear: 20,
+        // 400 × 3 s = 20 min: mais que o pior caso de uma execução (≈ 8 min).
+        trava: 400,
     };
 }
 
@@ -660,6 +707,18 @@ pub(crate) enum Saida {
     Concluida,
     /// Não deu para garantir: tarefas mantidas, sem `concluido`; repete no próximo disparo.
     Pendente,
+    /// Outra execução segura a trava: nada foi tocado (código 3).
+    Ocupada,
+}
+
+impl Saida {
+    fn codigo(self) -> u8 {
+        match self {
+            Saida::Concluida => 0,
+            Saida::Pendente => 1,
+            Saida::Ocupada => 3,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,22 +728,84 @@ pub(crate) enum Passo {
     Se { cond: Cond, nao: bool, ir: &'static str },
     Ir(&'static str),
     Log(&'static str),
+    /// `Log` e também na tela (modo manual, rodado pelo técnico).
+    Aviso(&'static str),
     /// Para o serviço, espera STOPPED (`Tempos::parar`) e encerra os processos do app.
     PararServico,
-    /// `rd /s /q` (erro ignorado: o `Renomear` seguinte falha se a pasta ficou).
+    /// `rd /s /q` (erro ignorado: o passo seguinte confere se a pasta ficou).
     Apagar(Pasta),
     /// `ren` com novas tentativas; falha se o destino existir; confere o destino depois.
     Renomear { de: Pasta, para: Pasta, falha: &'static str },
+    /// `.falhou` que não saiu com `Apagar` vai para o primeiro `.falhou.<n>` livre
+    /// (`AFASTADAS`); confere que o destino existe e `.falhou` não.
+    Afastar { falha: &'static str },
     /// Sobe o serviço e exige RUNNING estável (`subir_estavel`).
     SubirEstavel { falha: &'static str },
     /// Grava `concluido` e confere que ficou.
     MarcarConcluido { falha: &'static str },
+    /// Apaga as duas tarefas fixas e a `religar`.
     ApagarTarefas,
+    // ---- só fora da trava (modos) ----
+    /// Registra a tarefa `religar` (ao iniciar, SYSTEM: `recuperar.bat religar`).
+    CriarReligar { falha: &'static str },
+    /// `schtasks /Change /DISABLE` em cada tarefa fixa que existe (sumiu = ok).
+    DesabilitarTarefas { falha: &'static str },
+    /// `schtasks /Change /ENABLE` em cada tarefa fixa que existe (erro só registrado).
+    HabilitarTarefas,
+    /// Pega a trava e roda o corpo (`programa_recuperar`) com ela; solta ao sair dele.
+    /// Ocupada: `esperar` = tenta de novo `Tempos::trava` vezes (3 s cada); senão desiste.
+    ComTrava {
+        esperar: bool,
+        concluida: &'static str,
+        pendente: &'static str,
+        ocupada: &'static str,
+    },
     Sair(Saida),
 }
 
-/// Tabela da recuperação. Invariante: nenhum passo deixa as três pastas sem o EXE (só
-/// renomeia uma pasta para um nome livre; só apaga `.falhou` quando `.anterior` tem o EXE).
+impl Passo {
+    /// Passos que só podem rodar com a trava (corpo).
+    fn do_corpo(&self) -> bool {
+        matches!(
+            self,
+            Passo::Se { .. }
+                | Passo::PararServico
+                | Passo::Apagar(_)
+                | Passo::Renomear { .. }
+                | Passo::Afastar { .. }
+                | Passo::SubirEstavel { .. }
+                | Passo::MarcarConcluido { .. }
+                | Passo::ApagarTarefas
+        )
+    }
+    /// Passos que só podem rodar fora da trava (modos).
+    fn do_modo(&self) -> bool {
+        matches!(
+            self,
+            Passo::CriarReligar { .. }
+                | Passo::DesabilitarTarefas { .. }
+                | Passo::HabilitarTarefas
+                | Passo::ComTrava { .. }
+        )
+    }
+    fn destinos(&self) -> Vec<&'static str> {
+        match *self {
+            Passo::Se { ir, .. } | Passo::Ir(ir) => vec![ir],
+            Passo::Renomear { falha, .. }
+            | Passo::Afastar { falha }
+            | Passo::SubirEstavel { falha }
+            | Passo::MarcarConcluido { falha }
+            | Passo::CriarReligar { falha }
+            | Passo::DesabilitarTarefas { falha } => vec![falha],
+            Passo::ComTrava { concluida, pendente, ocupada, .. } => vec![concluida, pendente, ocupada],
+            _ => vec![],
+        }
+    }
+}
+
+/// Corpo da recuperação (roda sempre com a trava). Invariante: nenhum passo deixa as três
+/// pastas sem o EXE (só renomeia uma pasta para um nome livre; só apaga `.falhou` quando
+/// `.anterior` tem o EXE; um `.falhou` que não sai é afastado, nunca sobrescrito).
 pub(crate) fn programa_recuperar() -> Vec<Passo> {
     use Cond::*;
     use Pasta::*;
@@ -700,6 +821,11 @@ pub(crate) fn programa_recuperar() -> Vec<Passo> {
         PararServico,
         Se { cond: Existe(Atual), nao: true, ir: "restaurar" },
         Apagar(Falhou),
+        // R5: `.falhou` que não saiu (arquivo preso) é afastado em vez de travar a tabela.
+        Se { cond: Existe(Falhou), nao: true, ir: "mover_atual" },
+        Log("falhou presa afastando"),
+        Afastar { falha: "garantir" },
+        Rotulo("mover_atual"),
         Renomear { de: Atual, para: Falhou, falha: "garantir" },
         Rotulo("restaurar"),
         Renomear { de: Anterior, para: Atual, falha: "devolver" },
@@ -728,6 +854,106 @@ pub(crate) fn programa_recuperar() -> Vec<Passo> {
     ]
 }
 
+/// Sem argumento (guarda, tarefa ao iniciar, tarefa de minuto): trava livre = corpo; ocupada =
+/// sai com 3 sem tocar em nada.
+pub(crate) fn programa_automatico() -> Vec<Passo> {
+    use Passo::*;
+    vec![
+        ComTrava {
+            esperar: false,
+            concluida: "auto_ok",
+            pendente: "auto_pendente",
+            ocupada: "auto_ocupado",
+        },
+        Rotulo("auto_ok"),
+        Sair(Saida::Concluida),
+        Rotulo("auto_pendente"),
+        Sair(Saida::Pendente),
+        Rotulo("auto_ocupado"),
+        Log("ocupado"),
+        Sair(Saida::Ocupada),
+    ]
+}
+
+/// `recuperar.bat manual` (R5, achado 1), rodado pelo técnico como administrador:
+/// 1. registra `religar` (se cair daqui em diante, o boot reabilita as tarefas);
+/// 2. desabilita as duas tarefas fixas (a execução em curso continua até sair);
+/// 3. espera a trava — a mesma da troca, da guarda e das tarefas: enquanto qualquer uma delas
+///    roda o corpo, este modo não entra; depois que entra, nenhuma delas entra (saem com 3);
+/// 4. roda o mesmo corpo; as tarefas (e `religar`) só são apagadas por ele, depois de RUNNING
+///    estável e `concluido`; a trava é solta ao sair do corpo;
+/// 5. corpo pendente, trava que não veio ou falha ao desabilitar: reabilita as tarefas (a
+///    recuperação automática retoma no próximo minuto) e sai com 1.
+pub(crate) fn programa_manual() -> Vec<Passo> {
+    use Passo::*;
+    vec![
+        Aviso("manual inicio"),
+        CriarReligar { falha: "manual_sem_religar" },
+        DesabilitarTarefas { falha: "manual_reabilitar" },
+        Aviso("tarefas desabilitadas aguardando a trava"),
+        ComTrava {
+            esperar: true,
+            concluida: "manual_ok",
+            pendente: "manual_reabilitar",
+            ocupada: "manual_reabilitar",
+        },
+        Rotulo("manual_ok"),
+        Aviso("manual concluida servico rodando tarefas apagadas"),
+        Sair(Saida::Concluida),
+        Rotulo("manual_reabilitar"),
+        HabilitarTarefas,
+        Aviso("manual pendente tarefas reabilitadas"),
+        Sair(Saida::Pendente),
+        Rotulo("manual_sem_religar"),
+        Aviso("manual sem a tarefa religar nada foi mudado"),
+        Sair(Saida::Pendente),
+    ]
+}
+
+/// `recuperar.bat religar` (tarefa ao iniciar criada pelo modo manual): reabilita as tarefas
+/// fixas e roda o automático. Fica registrada até o corpo concluir (que a apaga).
+pub(crate) fn programa_religar() -> Vec<Passo> {
+    use Passo::*;
+    vec![
+        Log("religar"),
+        HabilitarTarefas,
+        ComTrava {
+            esperar: false,
+            concluida: "religar_ok",
+            pendente: "religar_pendente",
+            ocupada: "religar_ocupado",
+        },
+        Rotulo("religar_ok"),
+        Sair(Saida::Concluida),
+        Rotulo("religar_pendente"),
+        Sair(Saida::Pendente),
+        Rotulo("religar_ocupado"),
+        Sair(Saida::Ocupada),
+    ]
+}
+
+/// Os quatro programas do `recuperar.bat`.
+pub(crate) struct Modos {
+    pub automatico: Vec<Passo>,
+    pub manual: Vec<Passo>,
+    pub religar: Vec<Passo>,
+    pub corpo: Vec<Passo>,
+}
+
+impl Modos {
+    pub fn padrao() -> Self {
+        Self {
+            automatico: programa_automatico(),
+            manual: programa_manual(),
+            religar: programa_religar(),
+            corpo: programa_recuperar(),
+        }
+    }
+}
+
+/// Rótulos que o gerador usa por conta própria.
+const ROTULOS_RESERVADOS: [&str; 5] = ["principal", "ren", "ren_loop", "manual", "religar"];
+
 fn nome_simples(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == ' ')
 }
@@ -741,23 +967,19 @@ pub(crate) fn validar_programa(prog: &[Passo]) -> ResultType<HashMap<&'static st
                 if !nome_simples(r) || r.contains(' ') || r.starts_with('_') {
                     bail!("rótulo inválido: {r:?}");
                 }
+                if ROTULOS_RESERVADOS.contains(r) {
+                    bail!("rótulo reservado: {r}");
+                }
                 if rotulos.insert(*r, i).is_some() {
                     bail!("rótulo repetido: {r}");
                 }
             }
-            Passo::Log(m) if !nome_simples(m) => bail!("log inválido: {m:?}"),
+            Passo::Log(m) | Passo::Aviso(m) if !nome_simples(m) => bail!("log inválido: {m:?}"),
             _ => {}
         }
     }
     for p in prog {
-        let alvo = match p {
-            Passo::Se { ir, .. } | Passo::Ir(ir) => Some(*ir),
-            Passo::Renomear { falha, .. }
-            | Passo::SubirEstavel { falha }
-            | Passo::MarcarConcluido { falha } => Some(*falha),
-            _ => None,
-        };
-        if let Some(a) = alvo {
+        for a in p.destinos() {
             if !rotulos.contains_key(a) {
                 bail!("destino inexistente: {a}");
             }
@@ -769,49 +991,135 @@ pub(crate) fn validar_programa(prog: &[Passo]) -> ResultType<HashMap<&'static st
     Ok(rotulos)
 }
 
-/// Interpretador do programa (mesma semântica de cada passo no BAT). `apos` é chamado depois
-/// de cada passo (os testes conferem a invariante e simulam queda de energia ali).
-pub(crate) fn executar(
-    prog: &[Passo],
-    c: &Caminhos,
-    exe: &str,
-    s: &mut dyn Sistema,
-    t: &Tempos,
-    apos: &mut dyn FnMut(usize, &Passo),
-) -> Saida {
-    let rotulos = validar_programa(prog).expect("programa_recuperar válido");
-    let mut i = 0;
-    let mut contador = 0u32;
-    loop {
-        contador += 1;
-        assert!(contador < 100_000, "programa em laço");
-        let Some(passo) = prog.get(i) else {
-            return Saida::Pendente;
+/// Cada programa válido; o corpo só com passos de corpo e sem `Sair(Ocupada)`; os modos sem
+/// nenhum passo que mexa em pasta, serviço ou marcador (tudo isso só com a trava); rótulos
+/// únicos no BAT inteiro.
+pub(crate) fn validar_modos(m: &Modos) -> ResultType<()> {
+    let mut todos = std::collections::HashSet::new();
+    for (nome, prog, corpo) in [
+        ("automatico", &m.automatico, false),
+        ("manual", &m.manual, false),
+        ("religar", &m.religar, false),
+        ("corpo", &m.corpo, true),
+    ] {
+        validar_programa(prog).map_err(|e| anyhow!("{nome}: {e}"))?;
+        for p in prog.iter() {
+            if corpo && (p.do_modo() || *p == Passo::Sair(Saida::Ocupada)) {
+                bail!("{nome}: {p:?} não pode rodar com a trava");
+            }
+            if !corpo && p.do_corpo() {
+                bail!("{nome}: {p:?} só pode rodar com a trava");
+            }
+            if let Passo::Rotulo(r) = p {
+                if !todos.insert(*r) {
+                    bail!("rótulo repetido entre programas: {r}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execução retomável: um passo por `avancar`, para os testes intercalarem vários atores
+/// (técnico, guarda, tarefas) sobre o mesmo `Sistema`. `ComTrava` roda o corpo num `Exec`
+/// interno, um passo por vez, segurando a trava (`Sistema::travar`) do primeiro ao último.
+/// Mesma semântica de cada passo no BAT.
+pub(crate) struct Exec<'p> {
+    prog: &'p [Passo],
+    corpo: &'p [Passo],
+    rotulos: HashMap<&'static str, usize>,
+    i: usize,
+    contador: u32,
+    tentativas: u32,
+    dentro: Option<Box<Exec<'p>>>,
+}
+
+impl<'p> Exec<'p> {
+    pub fn novo(prog: &'p [Passo], corpo: &'p [Passo]) -> Self {
+        let rotulos = validar_programa(prog).expect("programa válido");
+        Self {
+            prog,
+            corpo,
+            rotulos,
+            i: 0,
+            contador: 0,
+            tentativas: 0,
+            dentro: None,
+        }
+    }
+
+    /// Está dentro do corpo (segura a trava).
+    pub fn no_corpo(&self) -> bool {
+        self.dentro.is_some()
+    }
+
+    /// Executa um passo: devolve o índice e o passo executado (o do corpo, se dentro dele) e a
+    /// saída, quando o programa termina.
+    pub fn avancar(
+        &mut self,
+        c: &Caminhos,
+        exe: &str,
+        s: &mut dyn Sistema,
+        t: &Tempos,
+    ) -> (usize, Passo, Option<Saida>) {
+        self.contador += 1;
+        assert!(self.contador < 1_000_000, "programa em laço");
+        let aqui = self.i;
+        let Some(&passo) = self.prog.get(aqui) else {
+            return (aqui, Passo::Sair(Saida::Pendente), Some(Saida::Pendente));
         };
-        let aqui = i;
-        i += 1;
-        let ir = |r: &str| rotulos[r];
-        match *passo {
-            Passo::Rotulo(_) => {}
-            Passo::Se { cond, nao, ir: r } => {
+        if let Passo::ComTrava {
+            esperar,
+            concluida,
+            pendente,
+            ocupada,
+        } = passo
+        {
+            if let Some(d) = self.dentro.as_mut() {
+                let (j, p, fim) = d.avancar(c, exe, s, t);
+                if let Some(x) = fim {
+                    self.dentro = None;
+                    s.soltar();
+                    let r = if x == Saida::Concluida { concluida } else { pendente };
+                    self.i = self.rotulos[r];
+                }
+                return (j, p, None);
+            }
+            if s.travar() {
+                self.tentativas = 0;
+                self.dentro = Some(Box::new(Exec::novo(self.corpo, self.corpo)));
+            } else if self.tentativas >= if esperar { t.trava } else { 0 } {
+                self.tentativas = 0;
+                self.i = self.rotulos[ocupada];
+            } else {
+                self.tentativas += 1;
+                s.esperar(t.passo * 3);
+            }
+            return (aqui, passo, None);
+        }
+        self.i += 1;
+        let mut salto = None;
+        match passo {
+            Passo::Rotulo(_) | Passo::ComTrava { .. } => {}
+            Passo::Se { cond, nao, ir } => {
                 let v = match cond {
                     Cond::Concluido => c.concluido().exists(),
                     Cond::Existe(p) => c.pasta(p).exists(),
                     Cond::ExisteExe(p) => c.pasta(p).join(exe).is_file(),
                 };
                 if v != nao {
-                    i = ir(r);
+                    salto = Some(ir);
                 }
             }
-            Passo::Ir(r) => i = ir(r),
-            Passo::Log(m) => log::info!("[portal-update] recuperar: {m}"),
+            Passo::Ir(r) => salto = Some(r),
+            Passo::Log(m) | Passo::Aviso(m) => log::info!("[portal-update] recuperar: {m}"),
             Passo::PararServico => {
                 s.parar_servico();
                 esperar_estado(s, Servico::Parado, t.parar, t);
                 s.encerrar_processos();
             }
             Passo::Apagar(p) => {
-                if let Err(e) = remover_arvore(c.pasta(p)) {
+                if let Err(e) = s.apagar(c.pasta(p)) {
                     log::warn!("[portal-update] recuperar: apagar {:?}: {}", c.pasta(p), e);
                 }
             }
@@ -821,27 +1129,74 @@ pub(crate) fn executar(
                     && renomear_tentando(s, de, para, t.renomear, t).is_ok()
                     && para.exists();
                 if !ok {
-                    i = ir(falha);
+                    salto = Some(falha);
+                }
+            }
+            Passo::Afastar { falha } => {
+                let livre = (1..=AFASTADAS).map(|n| c.afastada(n)).find(|d| !d.exists());
+                let ok = livre.map_or(false, |d| {
+                    renomear_tentando(s, &c.falhou, &d, t.renomear, t).is_ok()
+                        && d.exists()
+                        && !c.falhou.exists()
+                });
+                if !ok {
+                    salto = Some(falha);
                 }
             }
             Passo::SubirEstavel { falha } => {
                 if !subir_estavel(s, t) {
-                    i = ir(falha);
+                    salto = Some(falha);
                 }
             }
             Passo::MarcarConcluido { falha } => {
                 let ok = fs::write(c.concluido(), "ok").is_ok() && c.concluido().is_file();
                 if !ok {
-                    i = ir(falha);
+                    salto = Some(falha);
                 }
             }
             Passo::ApagarTarefas => s.apagar_tarefas(),
-            Passo::Sair(x) => {
-                apos(aqui, passo);
-                return x;
+            Passo::CriarReligar { falha } => {
+                if !s.criar_religar() {
+                    salto = Some(falha);
+                }
             }
+            Passo::DesabilitarTarefas { falha } => {
+                if !s.desabilitar_tarefas() {
+                    salto = Some(falha);
+                }
+            }
+            Passo::HabilitarTarefas => {
+                if !s.habilitar_tarefas() {
+                    log::warn!("[portal-update] recuperar: tarefa não reabilitada");
+                }
+            }
+            Passo::Sair(x) => return (aqui, passo, Some(x)),
         }
-        apos(aqui, passo);
+        if let Some(r) = salto {
+            self.i = self.rotulos[r];
+        }
+        (aqui, passo, None)
+    }
+}
+
+/// Roda `prog` até o fim (corpo: `programa_recuperar`). `apos` é chamado depois de cada passo
+/// (os testes conferem a invariante e simulam queda de energia ali).
+pub(crate) fn executar(
+    prog: &[Passo],
+    c: &Caminhos,
+    exe: &str,
+    s: &mut dyn Sistema,
+    t: &Tempos,
+    apos: &mut dyn FnMut(usize, &Passo),
+) -> Saida {
+    let corpo = programa_recuperar();
+    let mut e = Exec::novo(prog, &corpo);
+    loop {
+        let (i, p, fim) = e.avancar(c, exe, s, t);
+        apos(i, &p);
+        if let Some(x) = fim {
+            return x;
+        }
     }
 }
 
@@ -869,150 +1224,245 @@ fn nome_de(p: &Path) -> ResultType<String> {
     ))
 }
 
-/// Gera `recuperar.bat` a partir de `programa_recuperar` (passo a passo, mesma semântica do
-/// interpretador). Roda pela guarda e pelas tarefas (SYSTEM). Corpo em `:principal`, chamado
-/// com o descritor 9 redirecionado para `recuperar.lock`: se outro processo segura a trava, o
-/// redirecionamento falha, `:principal` não roda e sai com 3 (ocupado). `ren` (não `move`,
-/// que aninharia a pasta se o destino existisse).
+/// Tarefas agendadas da recuperação: as duas fixas (ao iniciar e a cada minuto, criadas pela
+/// troca) e a `religar` (criada só pelo modo manual).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tarefas<'a> {
+    pub fixas: &'a [&'a str],
+    pub religar: &'a str,
+}
+
+/// Gera `recuperar.bat` com os quatro programas (`Modos::padrao`). Roda pela guarda e pelas
+/// tarefas (SYSTEM, sem argumento), pelo técnico (`manual`) e pela tarefa `religar`. O corpo
+/// fica em `:principal` e só é chamado com o descritor 9 redirecionado para `recuperar.lock`:
+/// se outro processo segura a trava, o redirecionamento falha, `:principal` não roda e `SAIDA`
+/// continua 3. `ren` (não `move`, que aninharia a pasta se o destino existisse).
 pub(crate) fn script_recuperar(
     c: &Caminhos,
     app: &str,
     broker: &str,
-    tarefas: &[&str],
+    tarefas: &Tarefas,
     t: &Tempos,
 ) -> ResultType<String> {
-    script_de(&programa_recuperar(), c, app, broker, tarefas, t)
+    script_de(&Modos::padrao(), c, app, broker, tarefas, t)
+}
+
+struct Gerador<'a> {
+    c: &'a Caminhos,
+    app: &'a str,
+    exe: String,
+    tarefas: &'a Tarefas<'a>,
+    t: &'a Tempos,
+    parar_processos: [String; 2],
+}
+
+impl Gerador<'_> {
+    /// `pref`: prefixo dos rótulos internos (`_<pref><i>`); `corpo`: `Sair` volta do `call`.
+    fn emitir(&self, prog: &[Passo], pref: &str, corpo: bool, l: &mut Vec<String>) -> ResultType<()> {
+        let (app, exe, t) = (self.app, self.exe.as_str(), self.t);
+        let log = r#">> "%TROCA%\recuperar.log""#;
+        for (i, passo) in prog.iter().enumerate() {
+            let k = format!("_{pref}{i}");
+            match *passo {
+                Passo::Rotulo(r) => l.push(format!(":{r}")),
+                Passo::Se { cond, nao, ir } => {
+                    let alvo = match cond {
+                        Cond::Concluido => format!(r#""%TROCA%\{MARCADOR_CONCLUIDO}""#),
+                        Cond::Existe(p) => format!(r#""%{}%""#, p.var()),
+                        Cond::ExisteExe(p) => format!(r#""%{}%\{exe}""#, p.var()),
+                    };
+                    let not = if nao { "not " } else { "" };
+                    l.push(format!("if {not}exist {alvo} goto {ir}"));
+                }
+                Passo::Ir(r) => l.push(format!("goto {r}")),
+                Passo::Log(m) => l.push(format!("echo %DATE% %TIME% recuperar {m} {log}")),
+                Passo::Aviso(m) => {
+                    l.push(format!("echo recuperar: {m}"));
+                    l.push(format!("echo %DATE% %TIME% recuperar {m} {log}"));
+                }
+                Passo::PararServico => {
+                    l.push(format!(r#"sc stop "{app}" >nul 2>&1"#));
+                    l.push("set /a N=0".into());
+                    l.push(format!(":{k}"));
+                    l.push(format!(r#"sc query "{app}" | find "STOPPED" >nul && goto {k}_ok"#));
+                    l.push(format!("if %N% GEQ {} goto {k}_ok", t.parar));
+                    l.push("set /a N+=1".into());
+                    l.push("ping -n 2 127.0.0.1 >nul".into());
+                    l.push(format!("goto {k}"));
+                    l.push(format!(":{k}_ok"));
+                    l.extend(self.parar_processos.iter().cloned());
+                }
+                Passo::Apagar(p) => {
+                    l.push(format!(r#"if exist "%{0}%" rd /s /q "%{0}%""#, p.var()))
+                }
+                Passo::Renomear { de, para, falha } => {
+                    l.push(format!(
+                        r#"call :ren "%{}%" "{}" "%{}%""#,
+                        de.var(),
+                        nome_de(self.c.pasta(para))?,
+                        para.var()
+                    ));
+                    l.push(format!("if errorlevel 1 goto {falha}"));
+                    l.push(format!(r#"if not exist "%{}%" goto {falha}"#, para.var()));
+                }
+                Passo::Afastar { falha } => {
+                    let nome = nome_de(&self.c.falhou)?;
+                    l.push("set /a A=0".into());
+                    l.push(format!(":{k}"));
+                    l.push("set /a A+=1".into());
+                    l.push(format!("if %A% GTR {AFASTADAS} goto {falha}"));
+                    l.push(format!(r#"if exist "%FALHOU%.%A%" goto {k}"#));
+                    l.push(format!(r#"call :ren "%FALHOU%" "{nome}.%A%" "%FALHOU%.%A%""#));
+                    l.push(format!("if errorlevel 1 goto {falha}"));
+                    l.push(format!(r#"if not exist "%FALHOU%.%A%" goto {falha}"#));
+                    l.push(format!(r#"if exist "%FALHOU%" goto {falha}"#));
+                }
+                Passo::SubirEstavel { falha } => {
+                    l.push(format!(r#"sc start "{app}" >nul 2>&1"#));
+                    l.push("set /a N=0".into());
+                    l.push(format!(":{k}"));
+                    l.push(format!(r#"sc query "{app}" | find "RUNNING" >nul && goto {k}_ok"#));
+                    l.push(format!("if %N% GEQ {} goto {falha}", t.subir));
+                    l.push("set /a N+=1".into());
+                    l.push("ping -n 2 127.0.0.1 >nul".into());
+                    l.push(format!("goto {k}"));
+                    l.push(format!(":{k}_ok"));
+                    l.push("set /a N=0".into());
+                    l.push(format!(":{k}_e"));
+                    l.push(format!("if %N% GEQ {} goto {k}_fim", t.estavel));
+                    l.push("ping -n 2 127.0.0.1 >nul".into());
+                    l.push(format!(r#"sc query "{app}" | find "RUNNING" >nul || goto {falha}"#));
+                    l.push("set /a N+=1".into());
+                    l.push(format!("goto {k}_e"));
+                    l.push(format!(":{k}_fim"));
+                }
+                Passo::MarcarConcluido { falha } => {
+                    l.push(format!(r#"echo ok> "%TROCA%\{MARCADOR_CONCLUIDO}""#));
+                    l.push(format!(r#"if not exist "%TROCA%\{MARCADOR_CONCLUIDO}" goto {falha}"#));
+                }
+                Passo::ApagarTarefas => {
+                    for tn in self.tarefas.fixas.iter().chain([&self.tarefas.religar]) {
+                        l.push(format!(r#"schtasks /Delete /F /TN "{tn}" >nul 2>&1"#));
+                    }
+                }
+                Passo::CriarReligar { falha } => l.push(format!(
+                    r#"schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC ONSTART /TN "{}" /TR "\"%TROCA%\{SCRIPT_RECUPERAR}\" religar" >nul 2>&1 || goto {falha}"#,
+                    self.tarefas.religar
+                )),
+                Passo::DesabilitarTarefas { falha } => {
+                    // Desabilitou, ou a tarefa não existe (já apagada por uma execução que
+                    // concluiu): segue. Existe e não desabilitou: falha.
+                    for (j, tn) in self.tarefas.fixas.iter().enumerate() {
+                        l.push(format!(
+                            r#"schtasks /Change /TN "{tn}" /DISABLE >nul 2>&1 && goto {k}_{j}"#
+                        ));
+                        l.push(format!(r#"schtasks /Query /TN "{tn}" >nul 2>&1 && goto {falha}"#));
+                        l.push(format!(":{k}_{j}"));
+                    }
+                }
+                Passo::HabilitarTarefas => {
+                    for (j, tn) in self.tarefas.fixas.iter().enumerate() {
+                        l.push(format!(
+                            r#"schtasks /Change /TN "{tn}" /ENABLE >nul 2>&1 && goto {k}_{j}"#
+                        ));
+                        l.push(format!(
+                            r#"schtasks /Query /TN "{tn}" >nul 2>&1 && echo %DATE% %TIME% recuperar nao reabilitou {tn} {log}"#
+                        ));
+                        l.push(format!(":{k}_{j}"));
+                    }
+                }
+                Passo::ComTrava {
+                    esperar,
+                    concluida,
+                    pendente,
+                    ocupada,
+                } => {
+                    let n = if esperar { t.trava } else { 0 };
+                    if n > 0 {
+                        l.push("set /a T=0".into());
+                        l.push(format!(":{k}"));
+                    }
+                    l.push(r#"set "SAIDA=3""#.into());
+                    l.push(format!(r#"call :principal 9>"%TROCA%\{TRAVA}""#));
+                    l.push(format!(r#"if "%SAIDA%"=="0" goto {concluida}"#));
+                    l.push(format!(r#"if "%SAIDA%"=="1" goto {pendente}"#));
+                    if n > 0 {
+                        l.push(format!("if %T% GEQ {n} goto {ocupada}"));
+                        l.push("set /a T+=1".into());
+                        l.push("ping -n 4 127.0.0.1 >nul".into());
+                        l.push(format!("goto {k}"));
+                    } else {
+                        l.push(format!("goto {ocupada}"));
+                    }
+                }
+                Passo::Sair(x) => {
+                    if corpo {
+                        l.push(format!(r#"set "SAIDA={}""#, x.codigo()));
+                    }
+                    l.push(format!("exit /b {}", x.codigo()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn script_de(
-    prog: &[Passo],
+    m: &Modos,
     c: &Caminhos,
     app: &str,
     broker: &str,
-    tarefas: &[&str],
+    tarefas: &Tarefas,
     t: &Tempos,
 ) -> ResultType<String> {
-    for v in [app, broker].iter().chain(tarefas) {
+    for v in [app, broker, tarefas.religar].iter().chain(tarefas.fixas) {
         if !seguro_para_cmd(v) {
             bail!("nome inválido para o cmd: {v:?}");
         }
     }
-    validar_programa(prog)?;
-    let mut o: Vec<String> = Vec::new();
-    let mut l = |s: String| o.push(s);
-    l("@echo off".into());
-    l("setlocal EnableExtensions DisableDelayedExpansion".into());
-    l(r#"cd /d "%SystemRoot%""#.into());
-    for p in Pasta::TODAS {
-        l(format!(r#"set "{}={}""#, p.var(), texto(c.pasta(p))?));
-    }
-    l(format!(r#"set "TROCA={}""#, texto(&c.troca)?));
-    l(r#"set "SAIDA=3""#.into());
-    l(format!(r#"call :principal 9>"%TROCA%\{TRAVA}""#));
-    l(format!(
-        r#"if "%SAIDA%"=="3" echo %DATE% %TIME% ocupado >> "%TROCA%\recuperar.log""#
-    ));
-    l("exit /b %SAIDA%".into());
-    l(":principal".into());
+    validar_modos(m)?;
     let exe = format!("{app}.exe");
-    let parar_processos = [
-        format!(r#"taskkill /F /IM "{exe}" >nul 2>&1"#),
-        format!(r#"taskkill /F /IM "{broker}" >nul 2>&1"#),
-    ];
-    for (i, passo) in prog.iter().enumerate() {
-        let k = format!("_s{i}");
-        match *passo {
-            Passo::Rotulo(r) => l(format!(":{r}")),
-            Passo::Se { cond, nao, ir } => {
-                let alvo = match cond {
-                    Cond::Concluido => format!(r#""%TROCA%\{MARCADOR_CONCLUIDO}""#),
-                    Cond::Existe(p) => format!(r#""%{}%""#, p.var()),
-                    Cond::ExisteExe(p) => format!(r#""%{}%\{exe}""#, p.var()),
-                };
-                let not = if nao { "not " } else { "" };
-                l(format!("if {not}exist {alvo} goto {ir}"));
-            }
-            Passo::Ir(r) => l(format!("goto {r}")),
-            Passo::Log(m) => l(format!(
-                r#"echo %DATE% %TIME% recuperar {m} >> "%TROCA%\recuperar.log""#
-            )),
-            Passo::PararServico => {
-                l(format!(r#"sc stop "{app}" >nul 2>&1"#));
-                l("set /a N=0".into());
-                l(format!(":{k}"));
-                l(format!(r#"sc query "{app}" | find "STOPPED" >nul && goto {k}_ok"#));
-                l(format!("if %N% GEQ {} goto {k}_ok", t.parar));
-                l("set /a N+=1".into());
-                l("ping -n 2 127.0.0.1 >nul".into());
-                l(format!("goto {k}"));
-                l(format!(":{k}_ok"));
-                for p in &parar_processos {
-                    l(p.clone());
-                }
-            }
-            Passo::Apagar(p) => l(format!(r#"if exist "%{0}%" rd /s /q "%{0}%""#, p.var())),
-            Passo::Renomear { de, para, falha } => {
-                l(format!(
-                    r#"call :ren "%{}%" "{}" "%{}%""#,
-                    de.var(),
-                    nome_de(c.pasta(para))?,
-                    para.var()
-                ));
-                l(format!("if errorlevel 1 goto {falha}"));
-                l(format!(r#"if not exist "%{}%" goto {falha}"#, para.var()));
-            }
-            Passo::SubirEstavel { falha } => {
-                l(format!(r#"sc start "{app}" >nul 2>&1"#));
-                l("set /a N=0".into());
-                l(format!(":{k}"));
-                l(format!(r#"sc query "{app}" | find "RUNNING" >nul && goto {k}_ok"#));
-                l(format!("if %N% GEQ {} goto {falha}", t.subir));
-                l("set /a N+=1".into());
-                l("ping -n 2 127.0.0.1 >nul".into());
-                l(format!("goto {k}"));
-                l(format!(":{k}_ok"));
-                l("set /a N=0".into());
-                l(format!(":{k}_e"));
-                l(format!("if %N% GEQ {} goto {k}_fim", t.estavel));
-                l("ping -n 2 127.0.0.1 >nul".into());
-                l(format!(r#"sc query "{app}" | find "RUNNING" >nul || goto {falha}"#));
-                l("set /a N+=1".into());
-                l(format!("goto {k}_e"));
-                l(format!(":{k}_fim"));
-            }
-            Passo::MarcarConcluido { falha } => {
-                l(format!(r#"echo ok> "%TROCA%\{MARCADOR_CONCLUIDO}""#));
-                l(format!(r#"if not exist "%TROCA%\{MARCADOR_CONCLUIDO}" goto {falha}"#));
-            }
-            Passo::ApagarTarefas => {
-                for tn in tarefas {
-                    l(format!(r#"schtasks /Delete /F /TN "{tn}" >nul 2>&1"#));
-                }
-            }
-            Passo::Sair(Saida::Concluida) => {
-                l(r#"set "SAIDA=0""#.into());
-                l("exit /b 0".into());
-            }
-            Passo::Sair(Saida::Pendente) => {
-                l(r#"set "SAIDA=1""#.into());
-                l("exit /b 1".into());
-            }
-        }
+    let g = Gerador {
+        c,
+        app,
+        parar_processos: [
+            format!(r#"taskkill /F /IM "{exe}" >nul 2>&1"#),
+            format!(r#"taskkill /F /IM "{broker}" >nul 2>&1"#),
+        ],
+        exe,
+        tarefas,
+        t,
+    };
+    let mut l: Vec<String> = Vec::new();
+    l.push("@echo off".into());
+    l.push("setlocal EnableExtensions DisableDelayedExpansion".into());
+    l.push(r#"cd /d "%SystemRoot%""#.into());
+    for p in Pasta::TODAS {
+        l.push(format!(r#"set "{}={}""#, p.var(), texto(c.pasta(p))?));
     }
+    l.push(format!(r#"set "TROCA={}""#, texto(&c.troca)?));
+    l.push(r#"if /i "%~1"=="manual" goto manual"#.into());
+    l.push(r#"if /i "%~1"=="religar" goto religar"#.into());
+    l.push(r#"if not "%~1"=="" exit /b 2"#.into());
+    g.emitir(&m.automatico, "a", false, &mut l)?;
+    l.push(":manual".into());
+    g.emitir(&m.manual, "m", false, &mut l)?;
+    l.push(":religar".into());
+    g.emitir(&m.religar, "r", false, &mut l)?;
+    l.push(":principal".into());
+    g.emitir(&m.corpo, "s", true, &mut l)?;
     // :ren <de> <novo nome> <destino completo>: o destino não pode existir.
-    l(":ren".into());
-    l(r#"if exist "%~3" exit /b 1"#.into());
-    l("set /a R=0".into());
-    l(":ren_loop".into());
-    l(r#"ren "%~1" "%~2" >nul 2>&1 && exit /b 0"#.into());
-    l("set /a R+=1".into());
-    l(format!("if %R% GEQ {} exit /b 1", t.renomear.max(1)));
-    for p in &parar_processos {
-        l(p.clone());
-    }
-    l("ping -n 4 127.0.0.1 >nul".into());
-    l("goto ren_loop".into());
-    let mut s = o.join("\r\n");
+    l.push(":ren".into());
+    l.push(r#"if exist "%~3" exit /b 1"#.into());
+    l.push("set /a R=0".into());
+    l.push(":ren_loop".into());
+    l.push(r#"ren "%~1" "%~2" >nul 2>&1 && exit /b 0"#.into());
+    l.push("set /a R+=1".into());
+    l.push(format!("if %R% GEQ {} exit /b 1", t.renomear.max(1)));
+    l.extend(g.parar_processos.iter().cloned());
+    l.push("ping -n 4 127.0.0.1 >nul".into());
+    l.push("goto ren_loop".into());
+    let mut s = l.join("\r\n");
     s.push_str("\r\n");
     Ok(s)
 }
