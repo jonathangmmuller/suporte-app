@@ -1,1 +1,3 @@
 * text=auto
+# Vetores assinados do atualizador: bytes exatos, sem conversão de fim de linha (CRLF quebra a assinatura no checkout do Windows).
+src/updater/portal/vetor/** -text
