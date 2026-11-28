@@ -3825,6 +3825,8 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
             apagar_tarefas: &mut apagar_tarefas_mut,
         },
     )?;
+    // Bancada (R6, item 2): vazia fora do build com a feature `bancada-pausas`.
+    troca::ponto_bancada("antes_preparar");
 
     // Janela e bandeja (como no upstream); voltam no fim, qualquer que seja o resultado.
     let main_window_pids =
@@ -3903,6 +3905,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     };
     let mut kill_ui = Some((main_window_pids, tray_pids));
     let mut antes_de_parar = || -> ResultType<()> {
+        troca::ponto_bancada("antes_scripts");
         for (p, t) in [(&recuperar, &texto_recuperar), (&guarda, &texto_guarda)] {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p)?;
@@ -3915,6 +3918,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         // Reinício no meio da troca e recuperação pendente: as duas rodam o mesmo script como
         // SYSTEM (serializadas pela trava) até o serviço ficar RUNNING.
         let tr = format!("\"{recuperar_s}\"");
+        troca::ponto_bancada("antes_tarefas");
         for (tn, quando) in [
             (tarefa.as_str(), &["/SC", "ONSTART"][..]),
             (tarefa_minuto.as_str(), &["/SC", "MINUTE", "/MO", "1"][..]),
@@ -3933,6 +3937,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
             }
         }
         // Guarda fora deste processo (sobrevive a ele; só age depois que ele sair).
+        troca::ponto_bancada("antes_guarda");
         let mut cmd = std::process::Command::new("cmd");
         cmd.raw_arg(format!("/d /c \"\"{guarda_s}\"\""));
         let filho = cmd
@@ -4009,6 +4014,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
     // Consistente = nada a recuperar e, se o serviço rodava antes, RUNNING confirmado.
     // As tarefas só saem com `concluido` gravado e conferido.
     if r.consistente() {
+        troca::ponto_bancada("antes_concluido");
         match std::fs::write(c.concluido(), "ok").and_then(|_| std::fs::read(c.concluido())) {
             Ok(b) if b == b"ok" => apagar_tarefas(),
             Ok(_) | Err(_) => {
