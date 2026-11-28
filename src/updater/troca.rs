@@ -1,7 +1,15 @@
-//! Troca da instalação do Windows com volta garantida (app de suporte).
+//! Troca da instalação do Windows com volta automática (app de suporte).
 //!
-//! Requisito: a máquina nunca pode ficar inacessível; ID, senha permanente e configuração
-//! (perfil do serviço, fora da pasta de instalação) não são tocados.
+//! Garantia (R4, sem exagero): o acesso remoto fica fora do ar só durante a troca (serviço
+//! parado → pastas renomeadas → serviço de volta, em geral segundos). Se a nova não sobe, a
+//! anterior volta sozinha. Se o processo morre ou a máquina desliga no meio, a guarda e as
+//! tarefas SYSTEM repetem a recuperação a cada boot e a cada minuto até o serviço ficar
+//! RUNNING estável no caminho instalado. O que NÃO dá para garantir: (1) prazo, se o `ren`
+//! ficar bloqueado para sempre (antivírus/arquivo preso) ou se o serviço não subir com
+//! nenhuma das cópias, a recuperação continua tentando e a máquina fica sem acesso remoto até
+//! alguém agir no local; (2) a sessão de quem está conectado cai na troca e precisa
+//! reconectar (uma sessão aberta depois da checagem também cai). ID, senha permanente e
+//! configuração (perfil do serviço, fora da pasta de instalação) não são tocados.
 //!
 //! Desenho (pastas irmãs da instalação, no mesmo volume, para `rename` atômico):
 //!   `<inst>.novo`      nova instalação montada e conferida ANTES de parar o serviço
@@ -11,6 +19,14 @@
 //!   `troca`            scripts da guarda/recuperação, trava, log e o marcador `concluido`
 //!
 //! Só atualiza quando a instalação, a pasta-mãe e os ancestrais estão protegidos (`acl`).
+//!
+//! 0. `abrir_troca` (R4): confere a cadeia existente de `troca` (dono, DACL, reparse em cada
+//!    componente) ANTES de ler marcadores ou apagar restos, cria o que faltar já protegido,
+//!    pega a trava e só então decide pela fase: `iniciada` sem `concluido` = troca iniciada
+//!    (é da recuperação; recusa sem tocar em nada); qualquer outra = preparação incompleta
+//!    ou troca concluída, descartada sob a trava (nunca toca a instalação atual).
+//!    `iniciada` é gravado só depois de a recuperação estar registrada (scripts, tarefas e
+//!    guarda) e conferida, imediatamente antes de parar o serviço.
 //!
 //! 1. `preparar`: `<inst>.novo` = cópia da instalação atual + arquivos da versão nova por cima
 //!    (mesma semântica do XCOPY antigo, que preservava arquivos extras), com sha256 de cada
@@ -45,6 +61,9 @@ use std::{
 pub(crate) const MARCADOR_CONCLUIDO: &str = "concluido";
 pub(crate) const TRAVA: &str = "recuperar.lock";
 pub(crate) const SCRIPT_RECUPERAR: &str = "recuperar.bat";
+pub(crate) const SCRIPT_GUARDA: &str = "guarda.bat";
+/// Gravado com a recuperação já registrada, logo antes de parar o serviço (R4, achado 2).
+pub(crate) const MARCADOR_INICIADA: &str = "iniciada";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caminhos {
@@ -85,28 +104,158 @@ impl Caminhos {
         }
     }
 
-    /// Uma troca anterior começou e não terminou (`troca` sem `concluido`): a recuperação
-    /// (guarda/tarefas) ainda é dona das pastas.
-    pub fn recuperacao_pendente(&self) -> bool {
-        fs::symlink_metadata(&self.troca).is_ok() && !self.concluido().exists()
+    pub fn iniciada(&self) -> PathBuf {
+        self.troca.join(MARCADOR_INICIADA)
     }
 
-    /// Apaga restos de uma atualização anterior já concluída. Nunca toca a instalação atual.
-    /// Recusa se a recuperação estiver pendente: `.anterior`/`.falhou` podem ser a única cópia
-    /// boa, e os scripts dela estão em `troca`.
-    pub fn limpar_restos(&self) -> ResultType<()> {
-        if self.recuperacao_pendente() {
-            bail!(
-                "recuperação de uma troca anterior pendente ({:?} sem {}); não atualizo",
-                self.troca,
-                MARCADOR_CONCLUIDO
-            );
+    /// Fase da última atualização, pelos marcadores. Só tem valor depois de a cadeia de
+    /// `troca` estar conferida (`abrir_troca`).
+    pub fn fase(&self) -> Fase {
+        if fs::symlink_metadata(&self.troca).is_err() {
+            Fase::Livre
+        } else if self.concluido().exists() {
+            Fase::Concluida
+        } else if self.iniciada().exists() {
+            Fase::TrocaIniciada
+        } else {
+            Fase::PreparacaoIncompleta
         }
-        for d in [&self.novo, &self.anterior, &self.falhou, &self.troca] {
-            remover_arvore(d)?;
-        }
-        Ok(())
     }
+
+    /// A troca começou e não terminou: a recuperação (guarda/tarefas) é dona das pastas.
+    pub fn recuperacao_pendente(&self) -> bool {
+        self.fase() == Fase::TrocaIniciada
+    }
+}
+
+/// Ver `Caminhos::fase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fase {
+    /// Sem pasta `troca`.
+    Livre,
+    /// `troca` sem `iniciada` nem `concluido`: caiu antes de parar o serviço. Nada foi
+    /// trocado; pode ser descartada.
+    PreparacaoIncompleta,
+    /// `iniciada` sem `concluido`: a troca pode ter começado; só a recuperação mexe.
+    TrocaIniciada,
+    /// `concluido`: serviço confirmado RUNNING depois da última troca.
+    Concluida,
+}
+
+/// O que `abrir_troca` precisa do sistema. No Windows: `acl::ler_descritor`,
+/// `acl::criar_pasta_protegida`, arquivo aberto com `share_mode(0)` e `schtasks /Delete`.
+pub(crate) struct Abrir<'a, T> {
+    pub ler: &'a mut dyn FnMut(&Path) -> io::Result<acl::Descritor>,
+    /// Cria uma pasta já protegida; falha se existir.
+    pub criar: &'a mut dyn FnMut(&Path) -> io::Result<()>,
+    /// Trava exclusiva (a mesma que o `recuperar.bat` tenta pegar); erro = ocupada.
+    pub travar: &'a mut dyn FnMut(&Path) -> io::Result<T>,
+    pub apagar_tarefas: &'a mut dyn FnMut(),
+}
+
+fn cadeia(
+    ler: &mut dyn FnMut(&Path) -> io::Result<acl::Descritor>,
+    p: &Path,
+    estritos: usize,
+) -> ResultType<()> {
+    acl::conferir_cadeia(p, estritos, ler).map_err(|e| {
+        log::error!("[portal-update] pasta não protegida, não atualizo: {e}");
+        anyhow!("pasta não protegida: {e}")
+    })
+}
+
+fn existe(p: &Path) -> ResultType<bool> {
+    match fs::symlink_metadata(p) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => bail!("{p:?}: {e}"),
+    }
+}
+
+fn remover_arquivo(p: &Path) -> ResultType<()> {
+    match fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => bail!("apagar {p:?}: {e}"),
+    }
+}
+
+/// Abre a pasta `troca` para uma atualização nova (R4, achados 1 e 2). Ordem:
+/// 1. confere a instalação (`atual`, 2 níveis estritos) e a parte EXISTENTE da cadeia de
+///    `troca` (`troca` se existe; senão `<App>`; senão `ProgramData`), ancestrais incluídos,
+///    antes de ler qualquer marcador ou apagar qualquer coisa;
+/// 2. cria o que falta (`<App>`, `troca`) já protegido e reconfere `troca`;
+/// 3. pega a trava; ocupada = outra atualização ou a recuperação rodando: sai;
+/// 4. com a trava, pela fase: `TrocaIniciada` = recusa sem tocar em nada (tarefas mantidas);
+///    as demais = descarta os restos (tarefas, scripts e marcadores; `.novo`; `.anterior` e
+///    `.falhou` só com a atual tendo o EXE), cada irmã conferida antes de apagar.
+/// Devolve a trava, que o chamador segura até o fim da troca.
+pub(crate) fn abrir_troca<T>(c: &Caminhos, exe: &str, a: &mut Abrir<T>) -> ResultType<T> {
+    let base = c
+        .troca
+        .parent()
+        .ok_or_else(|| anyhow!("sem pasta-mãe: {:?}", c.troca))?;
+    let raiz_dados = base
+        .parent()
+        .ok_or_else(|| anyhow!("sem pasta-mãe: {:?}", base))?;
+    cadeia(a.ler, &c.atual, 2)?;
+    if existe(&c.troca)? {
+        cadeia(a.ler, &c.troca, 1)?;
+    } else if existe(base)? {
+        cadeia(a.ler, base, 0)?;
+        (a.criar)(&c.troca).map_err(|e| anyhow!("criar {:?}: {e}", c.troca))?;
+    } else {
+        cadeia(a.ler, raiz_dados, 0)?;
+        (a.criar)(base).map_err(|e| anyhow!("criar {:?}: {e}", base))?;
+        (a.criar)(&c.troca).map_err(|e| anyhow!("criar {:?}: {e}", c.troca))?;
+    }
+    cadeia(a.ler, &c.troca, 1)?;
+    let trava = (a.travar)(&c.troca.join(TRAVA))
+        .map_err(|e| anyhow!("trava da recuperação ocupada ou inacessível: {e}"))?;
+    let fase = c.fase();
+    log::info!("[portal-update] fase da atualização anterior: {fase:?}");
+    if fase == Fase::TrocaIniciada {
+        bail!(
+            "troca anterior iniciada e não concluída ({:?} sem {}); a recuperação continua \
+             com as tarefas; não atualizo",
+            c.troca,
+            MARCADOR_CONCLUIDO
+        );
+    }
+    (a.apagar_tarefas)();
+    // `iniciada` antes de `concluido`: queda no meio nunca vira "iniciada sem concluido".
+    for nome in [MARCADOR_INICIADA, MARCADOR_CONCLUIDO, SCRIPT_RECUPERAR, SCRIPT_GUARDA] {
+        remover_arquivo(&c.troca.join(nome))?;
+    }
+    let atual_ok = c.atual.join(exe).is_file();
+    for d in [&c.novo, &c.anterior, &c.falhou] {
+        if !existe(d)? {
+            continue;
+        }
+        if *d != c.novo && !atual_ok {
+            bail!("instalação atual sem {exe}; não apago {d:?}");
+        }
+        cadeia(a.ler, d, 2)?;
+        remover_arvore(d)?;
+    }
+    Ok(trava)
+}
+
+/// Grava um marcador novo (falha se existir) e confere o que ficou no disco.
+pub(crate) fn gravar_marcador(p: &Path) -> ResultType<()> {
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(p)
+        .map_err(|e| anyhow!("gravar {p:?}: {e}"))?;
+    f.write_all(b"ok")?;
+    f.sync_all()?;
+    drop(f);
+    if fs::read(p)? != b"ok" {
+        bail!("{p:?} não ficou gravado");
+    }
+    Ok(())
 }
 
 fn remover_arvore(d: &Path) -> ResultType<()> {
@@ -442,9 +591,10 @@ pub(crate) enum Momento {
     AntesDeTrocar,
 }
 
-/// Fluxo completo: prepara e confere `.novo`, prepara a guarda (`antes_de_parar`) e só então
-/// troca. Falha antes da troca não toca o serviço nem a instalação atual. `conferir` refaz a
-/// conferência de ACL/reparse/hash nos `Momento`s; erro = não troca.
+/// Fluxo completo (depois de `abrir_troca`): prepara e confere `.novo`, prepara a guarda
+/// (`antes_de_parar`), grava `iniciada` e só então troca. Falha antes da troca não toca o
+/// serviço nem a instalação atual. `conferir` refaz a conferência de ACL/reparse/hash nos
+/// `Momento`s; erro = não troca.
 pub(crate) fn atualizar(
     c: &Caminhos,
     p: &Preparo,
@@ -461,7 +611,9 @@ pub(crate) fn atualizar(
         conferir(Momento::AntesDeExecutar)?;
         validar(&c.novo.join(p.exe_destino))?;
         antes_de_parar()?;
-        conferir(Momento::AntesDeTrocar)
+        conferir(Momento::AntesDeTrocar)?;
+        // Recuperação registrada e conferida: daqui em diante a troca é dela (achado 2).
+        gravar_marcador(&c.iniciada())
     });
     if let Err(e) = antes {
         if let Err(e2) = remover_arvore(&c.novo) {
