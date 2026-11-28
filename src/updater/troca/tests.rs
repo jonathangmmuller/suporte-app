@@ -21,7 +21,8 @@ const T0: Tempos = Tempos {
 
 fn tmp() -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
-    let d = std::env::temp_dir().join(format!(
+    // canônico: no macOS `/var` é link simbólico (os testes de reparse usam links reais)
+    let d = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!(
         "suporte-troca-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::SeqCst)
@@ -64,6 +65,7 @@ impl Cenario {
         escrever(&origem.join("rustdesk.exe"), exe_novo);
         escrever(&origem.join("librustdesk.dll"), "dll 1.0.7");
         escrever(&origem.join("data").join("app.so"), "flutter 1.0.7");
+        fs::create_dir_all(raiz.join("ProgramData")).unwrap(); // existe em todo Windows
         let broker = raiz.join("System32").join("RuntimeBroker.exe");
         escrever(&broker, "broker");
         Self {
@@ -127,6 +129,8 @@ impl Drop for Cenario {
 struct Falso {
     c: Caminhos,
     estado: Servico,
+    /// Conteúdo do EXE que o serviço está rodando (vale com `estado == Rodando`).
+    rodando: Option<String>,
     consultas_ate_cair: Option<u32>,
     /// Nada sobe (serviço quebrado / conta do serviço sem permissão).
     quebrado: bool,
@@ -140,11 +144,16 @@ struct Falso {
 }
 
 impl Falso {
+    /// Estado coerente com o disco (R4, item 5): só começa RUNNING se o EXE em `atual` sobe
+    /// (`BOM`, ou `CAI`, que cai logo); senão começa parado.
     fn novo(c: &Caminhos) -> Self {
+        let exe = ler(&c.atual.join(EXE));
+        let sobe = exe.starts_with("BOM") || exe.starts_with("CAI");
         Self {
             c: c.clone(),
-            estado: Servico::Rodando,
-            consultas_ate_cair: None,
+            estado: if sobe { Servico::Rodando } else { Servico::Parado },
+            rodando: sobe.then(|| exe.clone()),
+            consultas_ate_cair: exe.starts_with("CAI").then_some(2),
             quebrado: false,
             falhas_renomear: HashMap::new(),
             tarefas: true,
@@ -168,9 +177,24 @@ impl Falso {
     }
 }
 
-/// Invariante: sempre existe uma pasta instalada utilizável (com o EXE).
+/// Invariante durante a recuperação: sempre existe uma pasta com o EXE (nenhum passo destrói
+/// a última cópia). Não basta para "concluída": ver `ativo_utilizavel`.
 fn alguma_utilizavel(c: &Caminhos) -> bool {
     Pasta::TODAS.iter().any(|p| c.pasta(*p).join(EXE).is_file())
+}
+
+/// Invariante literal de toda recuperação `Concluida` (R4, item 5): o caminho ativo
+/// (`InstallLocation` = `atual`) tem uma instalação que sobe e fica (`BOM`), e o serviço está
+/// RUNNING com ESSE conteúdo. EXE ruim/que cai, ou boa em outra pasta, não conta.
+fn ativo_utilizavel(c: &Caminhos, s: &Falso) -> Result<(), String> {
+    let exe = ler(&c.atual.join(EXE));
+    if !exe.starts_with("BOM") {
+        return Err(format!("caminho ativo com {exe:?}"));
+    }
+    if s.estado != Servico::Rodando || s.rodando.as_deref() != Some(exe.as_str()) {
+        return Err(format!("serviço {:?} rodando {:?}, ativo {exe:?}", s.estado, s.rodando));
+    }
+    Ok(())
 }
 
 impl Sistema for Falso {
@@ -196,13 +220,17 @@ impl Sistema for Falso {
         self.operacao();
         let exe = ler(&self.c.atual.join(EXE));
         self.ev(format!("iniciar:{exe}"));
+        // Já rodando: continua rodando o que rodava (ERROR_SERVICE_ALREADY_RUNNING). Como a
+        // pasta em uso não pode ser renomeada (`renomear`), é sempre o conteúdo de `atual`.
         if self.estado == Servico::Rodando || self.quebrado {
             return;
         }
         if exe.starts_with("BOM") {
             self.estado = Servico::Rodando;
+            self.rodando = Some(exe);
         } else if exe.starts_with("CAI") {
             self.estado = Servico::Rodando;
+            self.rodando = Some(exe);
             self.consultas_ate_cair = Some(2);
         }
     }
@@ -212,6 +240,11 @@ impl Sistema for Falso {
     }
     fn renomear(&mut self, de: &Path, para: &Path) -> io::Result<()> {
         self.operacao();
+        // Como no Windows: a pasta do EXE em execução não se renomeia.
+        if self.estado == Servico::Rodando && de == self.c.atual {
+            self.ev("ren-em-uso");
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "EXE em execução"));
+        }
         if let Some(n) = self.falhas_renomear.get_mut(de) {
             if *n > 0 {
                 *n -= 1;
@@ -498,20 +531,6 @@ fn recuperacao_respeita_concluido() {
 }
 
 #[test]
-fn limpar_restos_nao_toca_a_atual() {
-    let k = Cenario::novo("BOM 1.0.7");
-    for d in [&k.c.novo, &k.c.anterior, &k.c.falhou, &k.c.troca] {
-        escrever(&d.join("x"), "resto");
-    }
-    escrever(&k.c.concluido(), "ok");
-    k.c.limpar_restos().unwrap();
-    for d in [&k.c.novo, &k.c.anterior, &k.c.falhou, &k.c.troca] {
-        assert!(!d.exists());
-    }
-    k.anterior_intacta_no_lugar();
-}
-
-#[test]
 fn caminhos_irmaos() {
     let c = Caminhos::de(
         Path::new(r"C:\Program Files\SuporteVancin"),
@@ -637,22 +656,426 @@ fn novo_recriado_por_terceiro_e_recusado() {
     k.anterior_intacta_no_lugar();
 }
 
+// ------------------------------------------------------------------------------------
+// R4, achados 1 e 2: cadeia de `troca` conferida antes de ler marcadores ou apagar restos;
+// preparação incompleta x troca iniciada.
+// ------------------------------------------------------------------------------------
+
+const FULANO: &str = "S-1-5-21-1-2-3-1001";
+
+fn protegido() -> acl::Descritor {
+    acl::Descritor {
+        dono: acl::SID_SYSTEM.to_owned(),
+        dacl: Some(vec![]),
+        reparse: false,
+    }
+}
+
+/// Segurança simulada sobre pastas reais: link simbólico real = reparse point; o resto é
+/// protegido, salvo os `trocados`.
+fn ler_seguranca(
+    trocados: Vec<(PathBuf, acl::Descritor)>,
+) -> impl FnMut(&Path) -> io::Result<acl::Descritor> {
+    move |p: &Path| {
+        if let Some((_, d)) = trocados.iter().find(|(q, _)| q == p) {
+            return Ok(d.clone());
+        }
+        // como o `GetNamedSecurityInfoW`: caminho inexistente = erro (recusa)
+        let link = fs::symlink_metadata(p)?.file_type().is_symlink();
+        Ok(acl::Descritor {
+            reparse: link,
+            ..protegido()
+        })
+    }
+}
+
+fn travar_arquivo(p: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create(true).open(p)
+}
+
+/// `abrir_troca` com criação/tarefas registradas: (resultado, pastas criadas, apagou tarefas).
+fn abrir_com(
+    c: &Caminhos,
+    ler: &mut dyn FnMut(&Path) -> io::Result<acl::Descritor>,
+    travar: &mut dyn FnMut(&Path) -> io::Result<fs::File>,
+) -> (ResultType<fs::File>, Vec<PathBuf>, bool) {
+    let mut criadas = vec![];
+    let mut apagou = false;
+    let r = abrir_troca(
+        c,
+        EXE,
+        &mut Abrir {
+            ler,
+            criar: &mut |p: &Path| {
+                criadas.push(p.to_owned());
+                criar_pasta(p)
+            },
+            travar,
+            apagar_tarefas: &mut || apagou = true,
+        },
+    );
+    (r, criadas, apagou)
+}
+
+/// Restos de uma atualização anterior (irmãs da instalação e arquivos de `troca`).
+fn plantar_restos(c: &Caminhos, marcadores: &[&str]) -> Vec<PathBuf> {
+    let mut v = vec![];
+    for d in [&c.novo, &c.anterior, &c.falhou] {
+        escrever(&d.join(EXE), "BOM resto");
+        v.push(d.join(EXE));
+    }
+    for n in [SCRIPT_RECUPERAR, SCRIPT_GUARDA].iter().chain(marcadores) {
+        escrever(&c.troca.join(n), "resto");
+        v.push(c.troca.join(n));
+    }
+    v
+}
+
+fn nada_apagado(restos: &[PathBuf], ctx: &str) {
+    for r in restos {
+        assert!(r.is_file(), "{ctx}: apagou {r:?}");
+    }
+}
+
 #[test]
-fn recuperacao_pendente_impede_nova_atualizacao_e_limpeza() {
+fn abrir_troca_descarta_restos_de_troca_concluida_sem_tocar_a_atual() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let restos = plantar_restos(&k.c, &[MARCADOR_INICIADA, MARCADOR_CONCLUIDO]);
+    let (r, criadas, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    r.unwrap();
+    assert!(criadas.is_empty() && apagou);
+    for x in &restos {
+        assert!(!x.exists(), "sobrou {x:?}");
+    }
+    assert!(k.c.troca.join(TRAVA).is_file());
+    assert_eq!(k.c.fase(), Fase::PreparacaoIncompleta);
+    k.anterior_intacta_no_lugar();
+}
+
+#[test]
+fn abrir_troca_cria_base_e_troca_ja_conferidas() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let base = k.c.troca.parent().unwrap().to_owned();
+    assert!(!base.exists());
+    let (r, criadas, _) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    r.unwrap();
+    assert_eq!(criadas, vec![base, k.c.troca.clone()]);
+}
+
+/// `%ProgramData%\<App>` pré-criada por um usuário comum (dono dele), com ou sem
+/// `atualizacao` dentro: recusa sem ler marcador, sem apagar nada, sem criar nada e sem mexer
+/// nas tarefas.
+#[test]
+fn base_criada_por_usuario_comum_nao_causa_exclusao() {
+    for com_troca in [true, false] {
+        let k = Cenario::novo("BOM 1.0.7");
+        let base = k.c.troca.parent().unwrap().to_owned();
+        let restos = if com_troca {
+            plantar_restos(&k.c, &[MARCADOR_CONCLUIDO])
+        } else {
+            let mut v = vec![];
+            for d in [&k.c.novo, &k.c.anterior, &k.c.falhou] {
+                escrever(&d.join(EXE), "BOM resto");
+                v.push(d.join(EXE));
+            }
+            escrever(&base.join("plantado.txt"), "x");
+            v.push(base.join("plantado.txt"));
+            v
+        };
+        let mut do_usuario = protegido();
+        do_usuario.dono = FULANO.to_owned();
+        let (r, criadas, apagou) = abrir_com(
+            &k.c,
+            &mut ler_seguranca(vec![(base.clone(), do_usuario)]),
+            &mut travar_arquivo,
+        );
+        let e = r.unwrap_err().to_string();
+        let ctx = format!("com_troca={com_troca}: {e}");
+        assert!(e.contains("dono") && e.contains(FULANO), "{ctx}");
+        assert!(criadas.is_empty() && !apagou, "{ctx}");
+        nada_apagado(&restos, &ctx);
+        assert!(!k.c.troca.join(TRAVA).exists(), "{ctx}");
+        k.anterior_intacta_no_lugar();
+    }
+}
+
+/// Junção (reparse point) num ancestral de `troca` ou da instalação: recusa sem apagar nada.
+#[test]
+fn juncao_em_ancestral_nao_causa_exclusao() {
+    for qual in ["ProgramData", "Program Files", "raiz"] {
+        let k = Cenario::novo("BOM 1.0.7");
+        let restos = plantar_restos(&k.c, &[MARCADOR_CONCLUIDO]);
+        let alvo = match qual {
+            "raiz" => k.raiz.clone(),
+            n => k.raiz.join(n),
+        };
+        let mut j = protegido();
+        j.reparse = true;
+        let (r, criadas, apagou) =
+            abrir_com(&k.c, &mut ler_seguranca(vec![(alvo, j)]), &mut travar_arquivo);
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("reparse"), "{qual}: {e}");
+        assert!(criadas.is_empty() && !apagou, "{qual}");
+        nada_apagado(&restos, qual);
+        k.anterior_intacta_no_lugar();
+    }
+}
+
+/// O mesmo com um link simbólico REAL no ancestral: `ProgramData` aponta para outra pasta
+/// cheia de "restos". Nada do outro lado é lido como marcador nem apagado.
+#[cfg(unix)]
+#[test]
+fn link_real_em_ancestral_nao_causa_exclusao() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let outra = k.raiz.join("outra");
+    let plantados: Vec<PathBuf> = ["SuporteVancin/atualizacao/concluido", "SuporteVancin/atualizacao/recuperar.bat", "SuporteVancin/importante.txt"]
+        .iter()
+        .map(|r| {
+            let p = outra.join(r);
+            escrever(&p, "do outro lado");
+            p
+        })
+        .collect();
+    fs::remove_dir(k.raiz.join("ProgramData")).unwrap();
+    std::os::unix::fs::symlink(&outra, k.raiz.join("ProgramData")).unwrap();
+    assert!(k.c.concluido().is_file(), "o link resolve");
+    let (r, criadas, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("reparse") && e.contains("ProgramData"), "{e}");
+    assert!(criadas.is_empty() && !apagou);
+    nada_apagado(&plantados, "link real");
+    assert!(!outra.join("SuporteVancin/atualizacao").join(TRAVA).exists());
+}
+
+#[test]
+fn trava_ocupada_nao_apaga_nada() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let restos = plantar_restos(&k.c, &[MARCADOR_CONCLUIDO]);
+    let (r, _, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut |_| {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "em uso por outro processo"))
+    });
+    assert!(r.unwrap_err().to_string().contains("trava"));
+    assert!(!apagou);
+    nada_apagado(&restos, "trava ocupada");
+}
+
+/// `iniciada` sem `concluido`: a troca é da recuperação. Recusa sem apagar e sem mexer nas
+/// tarefas; depois de a recuperação concluir, a próxima atualização descarta e segue.
+#[test]
+fn troca_iniciada_recusa_sem_tocar_e_libera_depois_da_recuperacao() {
     let k = Cenario::novo("BOM 1.0.7");
     fs::rename(&k.c.atual, &k.c.anterior).unwrap(); // troca interrompida
     escrever(&k.c.troca.join(SCRIPT_RECUPERAR), "@echo off");
+    escrever(&k.c.iniciada(), "ok");
+    assert_eq!(k.c.fase(), Fase::TrocaIniciada);
     assert!(k.c.recuperacao_pendente());
-    let e = k.c.limpar_restos().unwrap_err().to_string();
-    assert!(e.contains("pendente"), "{e}");
+    // sem a instalação no caminho ativo: recusa já na cadeia, sem ler marcador
+    let (r, _, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    assert!(r.unwrap_err().to_string().contains("SuporteVancin"));
+    assert!(!apagou && k.c.anterior.join(EXE).is_file());
+    // nova (ruim) já no lugar: a fase manda
+    escrever(&k.c.atual.join(EXE), "RUIM 1.0.7");
+    let (r, _, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("iniciada e não concluída"), "{e}");
+    assert!(!apagou, "apagou as tarefas da recuperação");
     assert_eq!(ler(&k.c.anterior.join(EXE)), "BOM 1.0.6", "apagou a única cópia");
     assert!(k.c.troca.join(SCRIPT_RECUPERAR).is_file());
-    // depois de recuperada (concluido), a limpeza volta a valer
     let mut s = Falso::novo(&k.c);
     assert!(recuperar(&k.c, EXE, &mut s, &T0));
-    assert!(!k.c.recuperacao_pendente());
-    k.c.limpar_restos().unwrap();
+    assert_eq!(k.c.fase(), Fase::Concluida);
+    let (r, _, apagou) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    r.unwrap();
+    assert!(apagou && !k.c.iniciada().exists() && !k.c.concluido().exists());
     k.anterior_intacta_no_lugar();
+}
+
+#[test]
+fn atual_sem_exe_nao_apaga_anterior_nem_falhou() {
+    let k = Cenario::novo("BOM 1.0.7");
+    fs::remove_file(k.c.atual.join(EXE)).unwrap();
+    let restos = plantar_restos(&k.c, &[]);
+    let (r, _, _) = abrir_com(&k.c, &mut ler_seguranca(vec![]), &mut travar_arquivo);
+    assert!(r.unwrap_err().to_string().contains("sem"));
+    assert!(k.c.anterior.join(EXE).is_file() && k.c.falhou.join(EXE).is_file());
+    let _ = restos;
+}
+
+/// Operações contadas da preparação; pânico ("queda de energia") quando `vida` chega a 0.
+struct Prep {
+    vida: std::cell::Cell<Option<u32>>,
+    ops: std::cell::Cell<u32>,
+    tarefas: std::cell::Cell<bool>,
+}
+
+impl Prep {
+    fn novo(vida: Option<u32>) -> Self {
+        Self {
+            vida: vida.into(),
+            ops: 0.into(),
+            tarefas: false.into(),
+        }
+    }
+    fn tique(&self) {
+        self.ops.set(self.ops.get() + 1);
+        if let Some(v) = self.vida.get() {
+            if v == 0 {
+                panic!("queda de energia simulada");
+            }
+            self.vida.set(Some(v - 1));
+        }
+    }
+}
+
+impl Cenario {
+    /// Fluxo completo como no `update_me_suporte`: `abrir_troca` → `atualizar` (scripts,
+    /// tarefas e guarda em `antes_de_parar`) → `concluido` se consistente.
+    fn rodar_completo(&self, s: &mut Falso, p: &Prep) -> ResultType<Resultado> {
+        let c = &self.c;
+        let trava = abrir_troca(
+            c,
+            EXE,
+            &mut Abrir {
+                ler: &mut ler_seguranca(vec![]),
+                criar: &mut |d: &Path| {
+                    p.tique();
+                    criar_pasta(d)
+                },
+                travar: &mut |f: &Path| {
+                    p.tique();
+                    travar_arquivo(f)
+                },
+                apagar_tarefas: &mut || {
+                    p.tique();
+                    p.tarefas.set(false)
+                },
+            },
+        )?;
+        let extras: Vec<(PathBuf, String)> = vec![];
+        let preparo = Preparo {
+            origem: &self.origem,
+            exe_origem: "rustdesk.exe",
+            exe_destino: EXE,
+            extras: &extras,
+            remover: &[],
+            criar_novo: criar_pasta,
+        };
+        let r = atualizar(
+            c,
+            &preparo,
+            &mut |de: &Path, para: &Path| {
+                p.tique();
+                copiar_arquivo(de, para)
+            },
+            &mut |_| {
+                p.tique();
+                Ok(())
+            },
+            &mut |e: &Path| {
+                p.tique();
+                validar_ok(e)
+            },
+            &mut || {
+                assert!(!c.iniciada().exists(), "iniciada antes da recuperação registrada");
+                for n in [SCRIPT_RECUPERAR, SCRIPT_GUARDA] {
+                    p.tique();
+                    gravar_marcador(&c.troca.join(n))?;
+                }
+                p.tique();
+                p.tarefas.set(true);
+                p.tique(); // guarda iniciada
+                Ok(())
+            },
+            s,
+            true,
+            &T0,
+        );
+        if r.consistente() {
+            fs::write(c.concluido(), "ok")?;
+            p.tarefas.set(false);
+        }
+        drop(trava);
+        Ok(r)
+    }
+}
+
+/// Queda em cada ponto da preparação (criar pastas, trava, descarte, cópia, conferências,
+/// scripts, tarefas, guarda), com e sem a tarefa rodando a recuperação depois: nada é trocado,
+/// a atual continua no lugar e rodando, e a atualização seguinte funciona.
+#[test]
+fn queda_em_cada_ponto_da_preparacao_nao_bloqueia_a_seguinte() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    // máquina sem `ProgramData\<App>` e máquina com restos de uma atualização concluída
+    for com_restos in [false, true] {
+        let montar = || {
+            let k = Cenario::novo("BOM 1.0.7");
+            if com_restos {
+                plantar_restos(&k.c, &[MARCADOR_INICIADA, MARCADOR_CONCLUIDO]);
+            }
+            k
+        };
+        let total = {
+            let k = montar();
+            let mut s = Falso::novo(&k.c);
+            let p = Prep::novo(None);
+            assert_eq!(k.rodar_completo(&mut s, &p).unwrap(), Resultado::Atualizado);
+            p.ops.get()
+        };
+        assert!(total > 12, "{total}");
+        for ponto in 0..total {
+            for tarefa_roda in [false, true] {
+                let k = montar();
+                let mut s = Falso::novo(&k.c);
+                let p = Prep::novo(Some(ponto));
+                let caiu = queda(catch_unwind(AssertUnwindSafe(|| k.rodar_completo(&mut s, &p))));
+                let ctx = format!(
+                    "com_restos={com_restos} ponto={ponto}/{total} tarefa_roda={tarefa_roda} fase={:?}",
+                    k.c.fase()
+                );
+                assert!(caiu, "{ctx}");
+                assert_ne!(k.c.fase(), Fase::TrocaIniciada, "{ctx}");
+                assert!(!s.eventos().iter().any(|e| e == "parar"), "parou o serviço: {ctx}");
+                k.anterior_intacta_no_lugar();
+                if tarefa_roda && p.tarefas.get() {
+                    let mut s2 = Falso::novo(&k.c);
+                    assert!(recuperar(&k.c, EXE, &mut s2, &T0), "{ctx}");
+                    k.anterior_intacta_no_lugar();
+                }
+                let mut s3 = Falso::novo(&k.c);
+                let p3 = Prep::novo(None);
+                let r = k.rodar_completo(&mut s3, &p3);
+                assert!(matches!(r, Ok(Resultado::Atualizado)), "{ctx}: {r:?}");
+                assert_eq!(ler(&k.c.atual.join(EXE)), "BOM 1.0.7", "{ctx}");
+                ativo_utilizavel(&k.c, &s3).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+                assert!(!p3.tarefas.get(), "{ctx}");
+            }
+        }
+    }
+}
+
+/// `iniciada` só depois de scripts/tarefas/guarda e da conferência final; nada disso pronto =
+/// sem `iniciada` (preparação incompleta).
+#[test]
+fn iniciada_so_depois_da_recuperacao_registrada() {
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    let mut executou = false;
+    let r = k.rodar_conferindo(
+        &mut s,
+        &mut |m| match m {
+            Momento::AntesDeExecutar => Ok(()),
+            Momento::AntesDeTrocar => bail!("recuperar.bat com hash diferente"),
+        },
+        criar_pasta,
+        &mut executou,
+    );
+    assert!(matches!(r, Resultado::NaoTrocado(_)), "{r:?}");
+    assert!(!k.c.iniciada().exists());
+    assert_eq!(k.c.fase(), Fase::PreparacaoIncompleta);
+    let k = Cenario::novo("BOM 1.0.7");
+    let mut s = Falso::novo(&k.c);
+    assert_eq!(k.rodar_completo(&mut s, &Prep::novo(None)).unwrap(), Resultado::Atualizado);
+    assert!(k.c.iniciada().is_file() && k.c.concluido().is_file());
 }
 
 // ------------------------------------------------------------------------------------
@@ -745,15 +1168,63 @@ fn recuperar_conferindo(c: &Caminhos, s: &mut Falso) -> Saida {
     })
 }
 
+/// Estados em que a recuperação NÃO tem como concluir (R4, item 5). Neles ela fica
+/// `Pendente` (tarefas mantidas, sem `concluido`) e tenta de novo a cada minuto e a cada boot;
+/// nunca grava `concluido`. São necessários: fora deles, a recuperação sempre conclui.
+///  - `servico_quebrado`: o serviço não sobe com nenhuma cópia (SCM/conta/driver).
+///  - `nenhuma_boa`: nenhuma das três pastas tem uma instalação que sobe e fica.
+///  - `ren_bloqueado`: alguma pasta com `ren` bloqueado sem fim (antivírus/arquivo preso);
+///    converge quando o bloqueio some (`recuperacao_repetida_converge…`).
+///  - `anterior_que_nao_sobe`: troca interrompida em que a `.anterior` (a versão que rodava
+///    antes) não sobe; a recuperação a devolve ao lugar e ela não fica RUNNING. Só acontece se
+///    a versão antiga já caía antes da atualização.
+///  - `atual_que_nao_sobe_sem_anterior`: sem `.anterior`, a atual tem EXE que não sobe (a boa,
+///    se houver, está em `.falhou`). Não é alcançável pela troca: `.falhou` só recebe a nova
+///    que não subiu, e a atual é a anterior devolvida.
+///  - `concluido_com_atual_que_nao_sobe`: `concluido` já gravado (serviço foi confirmado) e a
+///    atual parou de subir depois. Não é alcançável: depois de `concluido` as tarefas saem.
+fn motivos_pendente(
+    estado: [Option<&str>; 3],
+    concluido: bool,
+    falhas: [u32; 3],
+    quebrado: bool,
+) -> Vec<&'static str> {
+    let bom = |x: Option<&str>| x == Some("BOM");
+    let [a, b, _f] = estado;
+    let mut m = vec![];
+    if quebrado {
+        m.push("servico_quebrado");
+    }
+    if !estado.iter().any(|x| bom(*x)) {
+        m.push("nenhuma_boa");
+    }
+    if falhas.iter().any(|n| *n >= 99) {
+        m.push("ren_bloqueado");
+    }
+    if b.is_some() && !bom(b) && !(concluido && a.is_some()) {
+        m.push("anterior_que_nao_sobe");
+    }
+    if b.is_none() && a.is_some() && !bom(a) {
+        m.push("atual_que_nao_sobe_sem_anterior");
+    }
+    if concluido && a.is_some() && !bom(a) {
+        m.push("concluido_com_atual_que_nao_sobe");
+    }
+    m
+}
+
 /// Todos os estados iniciais (cada pasta ausente/boa/ruim/sobe-e-cai, com e sem `concluido`),
 /// todos os padrões de falha de `ren` (0, 1 = passageira, 99 = permanente) por pasta, serviço
-/// parado ou rodando: a invariante vale em todo passo; `Concluida` só com a atual utilizável,
-/// RUNNING, `concluido` gravado e tarefas apagadas; `Pendente` mantém as tarefas e não grava
-/// `concluido`; a anterior boa nunca é destruída; com `concluido`, nada é renomeado.
+/// parado, rodando (só quando a atual sobe: estado coerente) ou quebrado: a invariante vale em
+/// todo passo; `Concluida` só com `ativo_utilizavel` (o caminho ativo com instalação que sobe
+/// e o serviço rodando ELA), `concluido` gravado e tarefas apagadas; `Pendente` só nos
+/// `motivos_pendente`, mantendo as tarefas e sem gravar `concluido`; a anterior boa nunca é
+/// destruída; com `concluido` e a atual presente, nada é renomeado.
 #[test]
 fn recuperacao_exaustiva() {
     let mut casos = 0;
     let mut concluidas = 0;
+    let mut por_motivo: BTreeMap<&str, u32> = BTreeMap::new();
     for a in CONTEUDOS {
         for b in CONTEUDOS {
             for f in CONTEUDOS {
@@ -761,14 +1232,24 @@ fn recuperacao_exaustiva() {
                 if estado.iter().all(Option::is_none) {
                     continue; // fora da invariante desde o início
                 }
+                let atual_sobe = matches!(a, Some("BOM") | Some("CAI"));
                 for concluido in [false, true] {
                     for padrao in 0..27usize {
                         let falhas = [padrao % 3, padrao / 3 % 3, padrao / 9].map(|i| [0, 1, 99][i]);
-                        for inicial in [Servico::Rodando, Servico::Parado] {
+                        for (inicial, quebrado) in [
+                            (Servico::Rodando, false),
+                            (Servico::Parado, false),
+                            (Servico::Parado, true),
+                        ] {
+                            if inicial == Servico::Rodando && !atual_sobe {
+                                continue; // RUNNING com EXE que não sobe: estado impossível
+                            }
                             casos += 1;
                             let m = Mini::novo(estado, concluido);
                             let mut s = Falso::novo(&m.c);
+                            assert_eq!(s.estado, if atual_sobe { Servico::Rodando } else { Servico::Parado });
                             s.estado = inicial;
+                            s.quebrado = quebrado;
                             for (p, n) in Pasta::TODAS.iter().zip(falhas) {
                                 if n > 0 {
                                     s.falhas_renomear.insert(m.c.pasta(*p).to_owned(), n);
@@ -776,19 +1257,26 @@ fn recuperacao_exaustiva() {
                             }
                             let anterior = ler(&m.c.anterior.join(EXE));
                             let saida = recuperar_conferindo(&m.c, &mut s);
+                            let motivos = motivos_pendente(estado, concluido, falhas, quebrado);
                             let ctx = format!(
-                                "{estado:?} concluido={concluido} falhas={falhas:?} {inicial:?} -> {saida:?} {:?}",
+                                "{estado:?} concluido={concluido} falhas={falhas:?} {inicial:?} \
+                                 quebrado={quebrado} -> {saida:?} {motivos:?} {:?}",
                                 s.eventos()
                             );
                             match saida {
                                 Saida::Concluida => {
                                     concluidas += 1;
-                                    assert!(m.c.atual.join(EXE).is_file(), "{ctx}");
-                                    assert_eq!(s.estado, Servico::Rodando, "{ctx}");
+                                    if let Err(e) = ativo_utilizavel(&m.c, &s) {
+                                        panic!("concluiu sem instalação utilizável no caminho ativo: {e}: {ctx}");
+                                    }
                                     assert!(m.c.concluido().is_file(), "{ctx}");
                                     assert!(!s.tarefas, "{ctx}");
                                 }
                                 Saida::Pendente => {
+                                    assert!(!motivos.is_empty(), "pendente sem motivo conhecido: {ctx}");
+                                    for x in &motivos {
+                                        *por_motivo.entry(x).or_default() += 1;
+                                    }
                                     assert!(s.tarefas, "apagou tarefas: {ctx}");
                                     assert_eq!(m.c.concluido().exists(), concluido, "{ctx}");
                                 }
@@ -802,7 +1290,7 @@ fn recuperacao_exaustiva() {
                                 );
                             }
                             if concluido && a.is_some() {
-                                assert!(!s.eventos().iter().any(|e| e.starts_with("ren")), "{ctx}");
+                                assert!(!s.eventos().iter().any(|e| e.starts_with("ren:")), "{ctx}");
                             }
                         }
                     }
@@ -810,8 +1298,11 @@ fn recuperacao_exaustiva() {
             }
         }
     }
-    assert_eq!(casos, 63 * 2 * 27 * 2);
+    // 63 estados × 2 (concluido) × 27 (falhas) × (parado + quebrado) + 32 estados com a atual
+    // que sobe × 2 × 27 rodando
+    assert_eq!(casos, 63 * 2 * 27 * 2 + 32 * 2 * 27);
     assert!(concluidas > 0 && concluidas < casos);
+    eprintln!("recuperacao_exaustiva: {casos} casos, {concluidas} concluídas, pendentes por motivo {por_motivo:?}");
 }
 
 /// Estados que uma troca interrompida deixa (a anterior boa em `.anterior`), com o `ren`
@@ -846,7 +1337,7 @@ fn recuperacao_repetida_converge_quando_o_bloqueio_some() {
             let ctx = format!("{estado:?} bloqueada={bloqueada:?} {saidas:?} {:?}", s.eventos());
             assert_eq!(saidas.last(), Some(&Saida::Concluida), "{ctx}");
             assert_eq!(ler(&m.c.atual.join(EXE)), "BOM Anterior", "{ctx}");
-            assert_eq!(s.estado, Servico::Rodando, "{ctx}");
+            ativo_utilizavel(&m.c, &s).unwrap_or_else(|e| panic!("{e}: {ctx}"));
             assert!(!s.tarefas, "{ctx}");
         }
     }
@@ -914,7 +1405,7 @@ fn queda_de_energia_em_cada_ponto_da_troca_e_da_recuperacao() {
                 let saida = recuperar_conferindo(&k.c, &mut s3);
                 let ctx = format!("{novo} k1={k1} k2={k2} 1a={primeira:?} {:?}", s3.eventos());
                 assert_eq!(saida, Saida::Concluida, "{ctx}");
-                assert_eq!(s3.estado, Servico::Rodando, "{ctx}");
+                ativo_utilizavel(&k.c, &s3).unwrap_or_else(|e| panic!("{e}: {ctx}"));
                 assert!(!s3.tarefas, "{ctx}");
                 let exe = ler(&k.c.atual.join(EXE));
                 if novo.starts_with("BOM") {

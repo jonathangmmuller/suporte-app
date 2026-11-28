@@ -3801,25 +3801,27 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         }
     };
 
-    // Restos de uma atualização anterior já concluída. Com recuperação pendente (`troca` sem
-    // `concluido`), `limpar_restos` recusa e as tarefas continuam.
-    c.limpar_restos()?;
-    apagar_tarefas();
-    if std::fs::symlink_metadata(&base).is_err() {
-        acl::criar_pasta_protegida(&base).map_err(|e| anyhow!("criar {:?}: {e}", base))?;
-    }
-    cadeia(&base, 0)?;
-    // Nasce com DACL protegida; falha se alguém a criou entre a limpeza e aqui.
-    acl::criar_pasta_protegida(&c.troca).map_err(|e| anyhow!("criar {:?}: {e}", c.troca))?;
-    cadeia(&c.troca, 1)?;
-    // Trava da recuperação: segurada até o fim; `recuperar.bat` (guarda/tarefas) sai com 3
-    // sem tocar em nada enquanto este processo vive.
-    let _trava = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(0)
-        .open(c.troca.join(troca::TRAVA))
-        .map_err(|e| anyhow!("trava da recuperação: {e}"))?;
+    // Cadeia de `%ProgramData%\<App>\atualizacao` conferida ANTES de ler marcadores ou apagar
+    // restos; trava; fase (troca iniciada = recusa; preparação incompleta/concluída =
+    // descarte). Trava segurada até o fim: `recuperar.bat` (guarda/tarefas) sai com 3 sem
+    // tocar em nada enquanto este processo vive.
+    let mut apagar_tarefas_mut = || apagar_tarefas();
+    let _trava = troca::abrir_troca(
+        &c,
+        &app_exe_name,
+        &mut troca::Abrir {
+            ler: &mut acl::ler_descritor,
+            criar: &mut acl::criar_pasta_protegida,
+            travar: &mut |p: &Path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .share_mode(0)
+                    .open(p)
+            },
+            apagar_tarefas: &mut apagar_tarefas_mut,
+        },
+    )?;
 
     // Janela e bandeja (como no upstream); voltam no fim, qualquer que seja o resultado.
     let main_window_pids =
@@ -3860,7 +3862,7 @@ fn update_me_suporte(debug: bool) -> ResultType<()> {
         troca::validar_exe(novo_exe, &relatorio, &esperado, Duration::from_secs(60))
     };
     let recuperar = c.troca.join(troca::SCRIPT_RECUPERAR);
-    let guarda = c.troca.join("guarda.bat");
+    let guarda = c.troca.join(troca::SCRIPT_GUARDA);
     let texto_recuperar = troca::script_recuperar(
         &c,
         &app_name,
