@@ -15,6 +15,9 @@ on:
       somente-entrada:
         type: boolean
         default: false
+      bancada:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       upload-artifact:
@@ -31,6 +34,10 @@ on:
         default: false
       somente-entrada:
         description: "Build de cliente (só recebe acesso)"
+        type: boolean
+        default: false
+      bancada:
+        description: "Bancada: só Windows, testes Rust, pausas por fase; nada publicado (só artefato do Actions)"
         type: boolean
         default: false
 
@@ -85,8 +92,9 @@ env:
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
-  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
-  PUBLISH_UPDATE_METADATA: "${{ inputs.publish-update-metadata }}"
+  # Bancada: UPLOAD_ARTIFACT e PUBLISH_UPDATE_METADATA forçados a false (nenhuma release/tag tocada).
+  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact && !inputs.bancada }}"
+  PUBLISH_UPDATE_METADATA: "${{ inputs.publish-update-metadata && !inputs.bancada }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
 
 jobs:
@@ -127,6 +135,7 @@ jobs:
         run: python res/update/generate_update_metadata.py check-key
 
   generate-sbom:
+    if: ${{ !inputs.bancada }}
     needs: [validate-update-metadata-keys]
     runs-on: ubuntu-latest
 
@@ -175,7 +184,7 @@ jobs:
               platform: ARM64,
             }
     with:
-      upload-artifact: ${{ inputs.upload-artifact }}
+      upload-artifact: ${{ inputs.upload-artifact && !inputs.bancada }}
       target: ${{ matrix.job.target }}
       configuration: Release
       platform: ${{ matrix.job.platform }}
@@ -367,7 +376,7 @@ jobs:
         run: |
           # Windows: build RustDesk
           # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
-          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} ${{ inputs.bancada && '--bancada-pausas' || '' }}
           mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
 
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
@@ -406,11 +415,12 @@ jobs:
 
       - name: Run the Rust tests
         # x86_64 only: the tests are the same code on arm64, and that runner is the slow one.
-        if: ${{ !inputs.upload-artifact && matrix.job.arch == 'x86_64' }}
+        # Bancada: sempre roda (inclui os testes das pausas, compilados com a feature).
+        if: ${{ (!inputs.upload-artifact || inputs.bancada) && matrix.job.arch == 'x86_64' }}
         shell: bash
         run: |
           # The build's own features, so the tests see the code that ships.
-          FEATURES=$(python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} --print-features)
+          FEATURES=$(python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} ${{ inputs.bancada && '--bancada-pausas' || '' }} --print-features)
           cargo test --locked --release --lib --features "$FEATURES"
           # Its Windows tests run nowhere else.
           cargo test --locked --release -p clipboard
@@ -433,10 +443,29 @@ jobs:
 
       - name: Download RustDeskTempTopMostWindow artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact && !inputs.bancada }}
         with:
           name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
           path: "./rustdesk"
+
+      - name: Bancada - conferir que nada sera publicado
+        if: ${{ inputs.bancada }}
+        shell: bash
+        run: |
+          test "$UPLOAD_ARTIFACT" = "false" && test "$PUBLISH_UPDATE_METADATA" = "false" \
+            || { echo "bancada com publicacao ligada"; exit 1; }
+          # A pasta que vira NOVA no roteiro: binário com as pausas de bancada.
+          grep -c SUPORTE_BANCADA_PAUSA ./rustdesk/*.dll ./rustdesk/*.exe | grep -v ':0$' \
+            || { echo "pausas de bancada ausentes do binario"; exit 1; }
+
+      - name: Bancada - artefato do Actions (sem release)
+        if: ${{ inputs.bancada }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bancada-${{ env.SUPORTE_APP_NAME }}-windows-${{ matrix.job.arch }}
+          path: ./rustdesk
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Upload unsigned
         if: env.UPLOAD_ARTIFACT == 'true'
@@ -642,6 +671,7 @@ jobs:
 
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
   build-for-windows-sciter:
+    if: ${{ !inputs.bancada }}
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.os }}
@@ -854,7 +884,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -976,6 +1006,7 @@ jobs:
 
 
   build-for-macOS:
+    if: ${{ !inputs.bancada }}
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -1268,7 +1299,7 @@ jobs:
   publish-signed-update-metadata:
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'rustdesk/rustdesk' }}
+    if: ${{ inputs.upload-artifact && inputs.publish-update-metadata && !inputs.bancada && github.repository == 'rustdesk/rustdesk' }}
     concurrency:
       group: signed-update-${{ inputs.upload-tag }}
       cancel-in-progress: false
@@ -1380,7 +1411,7 @@ jobs:
       - build-for-windows-flutter
       - build-for-windows-sciter
     runs-on: ubuntu-latest
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1461,6 +1492,7 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
+    if: ${{ !inputs.bancada }}
     needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
@@ -1756,7 +1788,7 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1939,6 +1971,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
+    if: ${{ !inputs.bancada }}
     needs: [generate-bridge]
     permissions:
       contents: write
@@ -2310,6 +2343,7 @@ jobs:
   # old for it. A separate job rather than a matrix entry of build-rustdesk-linux: appimage and
   # flatpak need that job, and a failure here must not skip them.
   build-rustdesk-linux-drm:
+    if: ${{ !inputs.bancada }}
     needs: [generate-bridge]
     name: build rustdesk linux drm x86_64
     runs-on: ubuntu-22.04
@@ -2629,7 +2663,7 @@ jobs:
           path: ${{ env.DRM_DEB }}
 
   build-rustdesk-linux-sciter:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.on }}
     name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
@@ -2875,7 +2909,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     strategy:
       fail-fast: false
       matrix:
@@ -2930,7 +2964,7 @@ jobs:
       - build-rustdesk-linux
       - build-rustdesk-linux-sciter
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && !inputs.bancada }}
     strategy:
       fail-fast: false
       matrix:
